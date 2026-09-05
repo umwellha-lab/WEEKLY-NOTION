@@ -92,6 +92,10 @@ CARRY_OVER_PROPS = ["오늘 수업내용", "숙제+교재단어", "학원단어"
 
 DRY_RUN = os.environ.get("DRY_RUN", "1") != "0"
 
+# 테스트용: TARGET_DATE 환경변수(YYYY-MM-DD)가 있으면 "오늘"을 그 날짜로 취급한다.
+# 평일이 아닐 때(주말) 실제 평일 데이터를 흉내내서 미리 검증하고 싶을 때 사용.
+_TARGET_DATE_OVERRIDE = os.environ.get("TARGET_DATE", "").strip()
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -445,7 +449,11 @@ def step4_link_exam_days(today: date, daily_rows: list[dict]) -> None:
 # --------------------------------------------------------------------------
 
 def main():
-    today = date.today()
+    if _TARGET_DATE_OVERRIDE:
+        today = date.fromisoformat(_TARGET_DATE_OVERRIDE)
+        log.info("[TEST MODE] TARGET_DATE 지정됨 -> 오늘을 %s 로 취급", today)
+    else:
+        today = date.today()
     log.info("=== 실행 시작: %s (DRY_RUN=%s) ===", today, DRY_RUN)
 
     timetable_rows = step1_generate_timetable(today)
