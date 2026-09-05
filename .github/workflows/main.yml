@@ -5,7 +5,16 @@ on:
     # 매주 월~금 새벽 6:00 KST = 전날 21:00 UTC (수업 시작 전 여유있게 생성)
     # cron 요일: 0=일, 1=월, 2=화, 3=수, 4=목, 5=금, 6=토
     - cron: "0 21 * * 0-4"   # UTC 기준 일~목 21시 = KST 월~금 06시
-  workflow_dispatch: {}   # Actions 탭에서 수동으로도 실행 가능하게
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: "테스트용 날짜 (YYYY-MM-DD). 비워두면 오늘 날짜 사용"
+        required: false
+        default: ""
+      dry_run:
+        description: "1이면 실제 쓰기 없이 로그만 확인"
+        required: false
+        default: "0"
 
 jobs:
   run:
@@ -23,4 +32,5 @@ jobs:
         run: python3 generate_weekly_daily_management.py
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          DRY_RUN: "0"
+          DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}
+          TARGET_DATE: ${{ github.event.inputs.target_date || '' }}
