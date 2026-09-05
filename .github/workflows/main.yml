@@ -1,0 +1,24 @@
+name: weekly-daily-management
+
+on:
+  schedule:
+    - cron: "0 12 * * 0"
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install requests
+
+      - name: Run generation script
+        run: python3 generate_weekly_daily_management.py
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          DRY_RUN: "0"
