@@ -2,8 +2,10 @@ name: weekly-daily-management
 
 on:
   schedule:
-    - cron: "0 12 * * 0"
-  workflow_dispatch: {}
+    # 매주 월~금 새벽 6:00 KST = 전날 21:00 UTC (수업 시작 전 여유있게 생성)
+    # cron 요일: 0=일, 1=월, 2=화, 3=수, 4=목, 5=금, 6=토
+    - cron: "0 21 * * 0-4"   # UTC 기준 일~목 21시 = KST 월~금 06시
+  workflow_dispatch: {}   # Actions 탭에서 수동으로도 실행 가능하게
 
 jobs:
   run:
