@@ -373,8 +373,9 @@ def step2_3_generate_daily(today: date, timetable_rows: list[dict]) -> list[dict
     existing_keys = set()
     for row in existing_daily:
         student_ids = get_relation_ids(row, "학생")
+        row_slot = get_select_name(row, "수업시간")
         if student_ids:
-            existing_keys.add(student_ids[0])
+            existing_keys.add((student_ids[0], row_slot))
 
     created_rows = list(existing_daily)
 
@@ -396,8 +397,10 @@ def step2_3_generate_daily(today: date, timetable_rows: list[dict]) -> list[dict
 
         for stu in students:
             stu_id = stu["id"]
-            if stu_id in existing_keys:
-                continue  # 이미 오늘 생성됨 (중복 방지)
+            dedup_key = (stu_id, daily_time)
+            if dedup_key in existing_keys:
+                continue  # 같은 학생의 같은 시간대 행이 이미 오늘 생성됨 (중복 방지)
+                # 주의: 같은 학생이라도 다른 시간대(예: 0720, 0840)면 별도로 생성됨
 
             stu_name = get_title_text(stu)
             row_title = f"{today.strftime('%Y.%m.%d')} | {daily_time} | {ban_title} | {stu_name} | {teacher_title}"
@@ -418,7 +421,7 @@ def step2_3_generate_daily(today: date, timetable_rows: list[dict]) -> list[dict
 
             new_row = create_page(DAILY_DB_ID, properties)
             created_rows.append(new_row)
-            existing_keys.add(stu_id)
+            existing_keys.add(dedup_key)
 
     log.info("STEP 2+3 완료: 오늘 매일관리 총 %d건", len(created_rows))
     return created_rows
