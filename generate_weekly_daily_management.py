@@ -203,7 +203,9 @@ def create_page(database_id: str, properties: dict) -> dict:
     body = {"parent": {"database_id": database_id}, "properties": properties}
     if DRY_RUN:
         log.info("[DRY_RUN] create_page(%s): %s", database_id, list(properties.keys()))
-        return {"id": "dry-run-fake-id"}
+        # 드라이런에서도 이후 단계가 방금 만든 값을 그대로 읽어 검증할 수 있도록,
+        # 실제로 쓰려던 properties를 그대로 돌려준다 (실제 쓰기는 하지 않음).
+        return {"id": f"dry-run-fake-{id(properties)}", "properties": properties}
     return _request("POST", "/pages", body)
 
 
@@ -230,7 +232,7 @@ def get_title_text(page: dict) -> str:
 
 def get_relation_ids(page: dict, prop_name: str) -> list[str]:
     prop = page.get("properties", {}).get(prop_name)
-    if not prop or prop.get("type") != "relation":
+    if not prop or "relation" not in prop:
         return []
     return [r["id"] for r in prop.get("relation", [])]
 
@@ -253,7 +255,7 @@ def get_date_start(page: dict, prop_name: str) -> Optional[str]:
 
 def get_rich_text(page: dict, prop_name: str) -> str:
     prop = page.get("properties", {}).get(prop_name)
-    if not prop or prop.get("type") != "rich_text":
+    if not prop or "rich_text" not in prop:
         return ""
     return "".join(p.get("plain_text", "") for p in prop.get("rich_text", []))
 
@@ -300,7 +302,7 @@ def step1_generate_timetable(today: date) -> list[dict]:
             continue  # 이미 이번 주 것이 있으면 건너뜀 (중복 생성 방지)
 
         properties: dict[str, Any] = {
-            "date:출제일:start": today.isoformat(),
+            "출제일": {"date": {"start": today.isoformat()}},
             "요일": {"select": {"name": get_select_name(src, "요일")}},
         }
         if time_slot:
@@ -329,7 +331,7 @@ def step1_generate_timetable(today: date) -> list[dict]:
             if start:
                 try:
                     d = date.fromisoformat(start[:10])
-                    properties[f"date:{date_prop}:start"] = (d + timedelta(days=7)).isoformat()
+                    properties[date_prop] = {"date": {"start": (d + timedelta(days=7)).isoformat()}}
                 except ValueError:
                     pass
 
@@ -402,7 +404,7 @@ def step2_3_generate_daily(today: date, timetable_rows: list[dict]) -> list[dict
 
             properties: dict[str, Any] = {
                 "이름": {"title": [{"text": {"content": row_title}}]},
-                "date:날짜:start": today.isoformat(),
+                "날짜": {"date": {"start": today.isoformat()}},
                 "학생": {"relation": [{"id": stu_id}]},
                 BAN_PROP_DAILY: {"relation": [{"id": ban_id}]},
             }
