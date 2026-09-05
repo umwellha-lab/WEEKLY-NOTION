@@ -90,11 +90,28 @@ TIME_MAP = {
 # 시간표에서 "이어지는 맥락"이 필요해 그대로 복사할 필드들 (학생 관계는 제외)
 CARRY_OVER_PROPS = ["오늘 수업내용", "숙제+교재단어", "학원단어", "교재이름"]
 
-DRY_RUN = os.environ.get("DRY_RUN", "1") != "0"
+# 실행 시작 시 실제 스키마를 조회해서 채워지는 값들 (혹시 모를 이름 불일치 방지용 안전장치)
+BAN_PROP_TT: str = ""       # 시간표 DB의 "반 DB" 속성 실제 이름
+BAN_PROP_DAILY: str = ""    # 매일관리 DB의 "반 DB" 속성 실제 이름
+BAN_PROP_STUDENT: str = ""  # 학생 DB2의 "반 DB" 속성 실제 이름
+
+
+def resolve_all_property_names() -> None:
+    global BAN_PROP_TT, BAN_PROP_DAILY, BAN_PROP_STUDENT
+    log.info("실제 속성명 조회 중 (이모지 제거 후 '반 DB'로 통일됨)...")
+    tt_schema = get_database_schema(TIMETABLE_DB_ID)
+    daily_schema = get_database_schema(DAILY_DB_ID)
+    student_schema = get_database_schema(STUDENT_DB_ID)
+    BAN_PROP_TT = resolve_property_name(tt_schema, "반 DB")
+    BAN_PROP_DAILY = resolve_property_name(daily_schema, "반 DB")
+    BAN_PROP_STUDENT = resolve_property_name(student_schema, "반 DB")
+    log.info("  시간표: %r / 매일관리: %r / 학생DB2: %r", BAN_PROP_TT, BAN_PROP_DAILY, BAN_PROP_STUDENT)
 
 # 테스트용: TARGET_DATE 환경변수(YYYY-MM-DD)가 있으면 "오늘"을 그 날짜로 취급한다.
 # 평일이 아닐 때(주말) 실제 평일 데이터를 흉내내서 미리 검증하고 싶을 때 사용.
 _TARGET_DATE_OVERRIDE = os.environ.get("TARGET_DATE", "").strip()
+
+DRY_RUN = os.environ.get("DRY_RUN", "1") != "0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -161,6 +178,24 @@ def query_database_all(database_id: str, filter_obj: Optional[dict] = None) -> l
 def get_page(page_id: str) -> dict:
     page_id = _normalize_id(page_id)
     return _request("GET", f"/pages/{page_id}")
+
+
+def get_database_schema(database_id: str) -> dict:
+    database_id = _normalize_id(database_id)
+    return _request("GET", f"/databases/{database_id}")
+
+
+def resolve_property_name(schema: dict, keyword: str) -> str:
+    """스키마에서 keyword(부분 문자열)를 포함하는 실제 속성 이름을 찾는다.
+    이모지 앞글자가 눈으로는 같아 보여도 유니코드가 다를 수 있어,
+    하드코딩 대신 항상 실제 API가 돌려준 속성 이름을 그대로 사용한다."""
+    props = schema.get("properties", {})
+    matches = [name for name in props if keyword in name]
+    if not matches:
+        raise RuntimeError(f"'{keyword}' 포함 속성을 찾지 못함. 실제 속성명: {list(props.keys())}")
+    if len(matches) > 1:
+        log.warning("  '%s' 포함 속성이 여러 개(%s) -> 첫 번째 사용: %s", keyword, matches, matches[0])
+    return matches[0]
 
 
 def create_page(database_id: str, properties: dict) -> dict:
@@ -252,13 +287,13 @@ def step1_generate_timetable(today: date) -> list[dict]:
     )
     existing_keys = set()
     for row in existing_today:
-        ban = tuple(sorted(get_relation_ids(row, "⭕ 반 DB")))
+        ban = tuple(sorted(get_relation_ids(row, BAN_PROP_TT)))
         existing_keys.add((ban, get_select_name(row, "시간")))
 
     today_rows = list(existing_today)
 
     for src in source_rows:
-        ban_ids = get_relation_ids(src, "⭕ 반 DB")
+        ban_ids = get_relation_ids(src, BAN_PROP_TT)
         time_slot = get_select_name(src, "시간")
         key = (tuple(sorted(ban_ids)), time_slot)
         if key in existing_keys:
@@ -272,7 +307,7 @@ def step1_generate_timetable(today: date) -> list[dict]:
             properties["시간"] = {"select": {"name": time_slot}}
         strand_days = get_select_name(src, "요일")
         if ban_ids:
-            properties["⭕ 반 DB"] = {"relation": [{"id": i} for i in ban_ids]}
+            properties[BAN_PROP_TT] = {"relation": [{"id": i} for i in ban_ids]}
         teacher_ids = get_relation_ids(src, "강사DB")
         if teacher_ids:
             properties["강사DB"] = {"relation": [{"id": i} for i in teacher_ids]}
@@ -319,7 +354,7 @@ def get_active_students_for_class(ban_id: str) -> list[dict]:
         STUDENT_DB_ID,
         filter_obj={
             "and": [
-                {"property": "⭕ 반 DB", "relation": {"contains": ban_id}},
+                {"property": BAN_PROP_STUDENT, "relation": {"contains": ban_id}},
                 {"property": "상태", "select": {"equals": "재원"}},
             ]
         },
@@ -342,7 +377,7 @@ def step2_3_generate_daily(today: date, timetable_rows: list[dict]) -> list[dict
     created_rows = list(existing_daily)
 
     for tt in timetable_rows:
-        ban_ids = get_relation_ids(tt, "⭕ 반 DB")
+        ban_ids = get_relation_ids(tt, BAN_PROP_TT)
         if not ban_ids:
             continue
         ban_id = ban_ids[0]
@@ -369,7 +404,7 @@ def step2_3_generate_daily(today: date, timetable_rows: list[dict]) -> list[dict
                 "이름": {"title": [{"text": {"content": row_title}}]},
                 "date:날짜:start": today.isoformat(),
                 "학생": {"relation": [{"id": stu_id}]},
-                "⭕ 반 DB": {"relation": [{"id": ban_id}]},
+                BAN_PROP_DAILY: {"relation": [{"id": ban_id}]},
             }
             if teacher_ids:
                 properties["담당"] = {"relation": [{"id": teacher_ids[0]}]}
@@ -397,7 +432,7 @@ def step4_link_exam_days(today: date, daily_rows: list[dict]) -> None:
     # 오늘 매일관리 행을 (반, 수업시간) 기준으로 그룹핑
     by_class_slot: dict[tuple, list[dict]] = {}
     for row in daily_rows:
-        ban_ids = get_relation_ids(row, "⭕ 반 DB")
+        ban_ids = get_relation_ids(row, BAN_PROP_DAILY)
         if not ban_ids:
             continue
         slot = get_select_name(row, "수업시간")
@@ -411,7 +446,7 @@ def step4_link_exam_days(today: date, daily_rows: list[dict]) -> None:
         log.info("  '%s'==오늘 인 시간표 %d건", date_prop, len(matches))
 
         for tt in matches:
-            ban_ids = get_relation_ids(tt, "⭕ 반 DB")
+            ban_ids = get_relation_ids(tt, BAN_PROP_TT)
             if not ban_ids:
                 continue
             ban_id = ban_ids[0]
@@ -455,6 +490,8 @@ def main():
     else:
         today = date.today()
     log.info("=== 실행 시작: %s (DRY_RUN=%s) ===", today, DRY_RUN)
+
+    resolve_all_property_names()
 
     timetable_rows = step1_generate_timetable(today)
     daily_rows = step2_3_generate_daily(today, timetable_rows)
