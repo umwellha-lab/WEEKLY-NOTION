@@ -9,6 +9,8 @@
   1. 시간표 생성        : 지난주 같은 요일의 시간표 행을 참고해 이번 주 시간표를 생성.
                           (진도/숙제처럼 "이어지는 맥락"이 필요한 필드만 지난 시간표에서 가져옴.
                            학생 관계는 이 단계에서 채우지 않음.)
+                          이미 이번 주 (반, 시간) 행이 존재하면 새로 만들지는 않되,
+                          그 행의 강사DB가 비어 있으면 지난주 소스 기준으로 채워 넣는다(백필).
   2. 학생 연결          : 새로 생성된 시간표 행의 '⭕ 반 DB' 관계를 보고,
                           해당 반에 속한 학생 중 학생 DB2의 상태가 '재원'인 학생만 연결.
   3. 매일관리 생성      : 연결된 (재원) 학생마다 매일관리 행을 하나씩 생성.
@@ -271,7 +273,8 @@ def title_lookup(page_id: str) -> str:
 
 def step1_generate_timetable(today: date) -> list[dict]:
     """지난주 같은 요일의 시간표를 복사해 이번 주(=today) 시간표를 생성한다.
-    이미 today 날짜로 생성된 (같은 반/시간) 행이 있으면 건너뛴다.
+    이미 today 날짜로 생성된 (같은 반/시간) 행이 있으면 새로 만들지는 않되,
+    그 기존 행의 강사DB가 비어 있고 지난주 소스에 강사DB가 있으면 채워 넣는다(백필).
     반환값: 오늘 생성/확인된 시간표 페이지 리스트 (신규+기존 포함, 3~4단계에서 사용).
     """
     last_week = today - timedelta(days=7)
@@ -288,9 +291,12 @@ def step1_generate_timetable(today: date) -> list[dict]:
         filter_obj={"property": "출제일", "date": {"equals": today.isoformat()}},
     )
     existing_keys = set()
+    existing_by_key: dict[tuple, dict] = {}
     for row in existing_today:
         ban = tuple(sorted(get_relation_ids(row, BAN_PROP_TT)))
-        existing_keys.add((ban, get_select_name(row, "시간")))
+        key = (ban, get_select_name(row, "시간"))
+        existing_keys.add(key)
+        existing_by_key[key] = row
 
     today_rows = list(existing_today)
 
@@ -299,7 +305,22 @@ def step1_generate_timetable(today: date) -> list[dict]:
         time_slot = get_select_name(src, "시간")
         key = (tuple(sorted(ban_ids)), time_slot)
         if key in existing_keys:
-            continue  # 이미 이번 주 것이 있으면 건너뜀 (중복 생성 방지)
+            # 이미 이번 주 행이 있으면 새로 만들지는 않되,
+            # 강사DB가 비어 있는 기존 행이면 지난주 소스 기준으로 채워 넣는다.
+            # (강사DB 로직이 없던 예전 버전 스크립트가 먼저 만들어둔 행을 복구하기 위함)
+            existing_row = existing_by_key.get(key)
+            if existing_row is not None:
+                existing_teacher_ids = get_relation_ids(existing_row, "강사DB")
+                src_teacher_ids = get_relation_ids(src, "강사DB")
+                if not existing_teacher_ids and src_teacher_ids:
+                    update_page(existing_row["id"], {
+                        "강사DB": {"relation": [{"id": i} for i in src_teacher_ids]}
+                    })
+                    log.info(
+                        "  강사DB 백필: 반=%s 시간=%s -> page=%s",
+                        ban_ids, time_slot, existing_row["id"],
+                    )
+            continue  # 이미 이번 주 것이 있으면 새 행은 만들지 않음 (중복 생성 방지)
 
         properties: dict[str, Any] = {
             "출제일": {"date": {"start": today.isoformat()}},
