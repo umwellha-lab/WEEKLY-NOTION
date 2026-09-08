@@ -38,6 +38,38 @@ class GenerationTests(unittest.TestCase):
         self.globals.start()
         self.addCleanup(self.globals.stop)
 
+    def test_new_timetable_copies_teacher_weekday_but_clears_lesson_fields(self):
+        source = timetable()
+        for name in ("오늘 수업내용", "숙제+교재단어", "학원단어"):
+            source["properties"][name] = {"type": "rich_text", "rich_text": [{"text": {"content": "previous lesson"}}]}
+        with patch.object(g, "query_database_all", side_effect=[[source], []]):
+            result = g.step1_generate_timetable(TODAY)
+        props = result[0]["properties"]
+        self.assertEqual(g.get_relation_ids(result[0], "강사DB"), ["teacher1"])
+        self.assertEqual(g.get_select_name(result[0], "요일"), "화")
+        for name in ("오늘 수업내용", "숙제+교재단어", "학원단어"):
+            self.assertEqual(props[name], {"rich_text": []})
+        for name in ("검사일", "단어시험일"):
+            self.assertEqual(props[name], {"date": None})
+
+    def test_existing_timetable_fills_weekday_without_erasing_lesson(self):
+        existing = timetable()
+        existing["properties"]["요일"] = {"select": None}
+        existing["properties"]["숙제+교재단어"] = {"rich_text": [{"text": {"content": "current homework"}}]}
+        with patch.object(g, "query_database_all", side_effect=[[timetable()], [existing]]), patch.object(g, "update_page"):
+            result = g.step1_generate_timetable(TODAY)
+        self.assertEqual(g.get_select_name(result[0], "요일"), "화")
+        self.assertEqual(g.get_rich_text(result[0], "숙제+교재단어"), "current homework")
+
+    def test_missing_or_conflicting_source_teacher_prevents_creation(self):
+        missing = timetable()
+        missing["properties"]["강사DB"] = rel()
+        for sources in ([missing], [timetable(), timetable("tt2", teacher="other")]):
+            with patch.object(g, "query_database_all", side_effect=[sources, []]), patch.object(g, "create_page") as create:
+                with self.assertRaises(RuntimeError):
+                    g.step1_generate_timetable(TODAY)
+                create.assert_not_called()
+
     def test_korean_date_at_scheduled_utc_time(self):
         self.assertEqual(g.get_target_date(datetime(2026, 9, 7, 21, tzinfo=timezone.utc)), TODAY)
         self.assertEqual(g.get_target_date(datetime(2026, 9, 7, 14, 59, tzinfo=timezone.utc)), date(2026, 9, 7))

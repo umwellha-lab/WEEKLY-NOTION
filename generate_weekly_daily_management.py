@@ -7,7 +7,7 @@
 4단계 루틴을 실제로 실행하는 스크립트입니다.
 
   1. 시간표 생성        : 지난주 같은 요일의 시간표 행을 참고해 이번 주 시간표를 생성.
-                          (진도/숙제처럼 "이어지는 맥락"이 필요한 필드만 지난 시간표에서 가져옴.
+                          (반/시간/강사/요일/교재이름을 가져오고, 수업내용·숙제·검사일·학원단어·단어시험일은 비움.
                            학생 관계는 이 단계에서 채우지 않음.)
                           이미 이번 주 (반, 시간) 행이 존재하면 새로 만들지는 않되,
                           그 행의 강사DB가 비어 있으면 지난주 소스 기준으로 채워 넣는다(백필).
@@ -91,8 +91,8 @@ TIME_MAP = {
     "8시 40": "0840",
 }
 
-# 시간표에서 "이어지는 맥락"이 필요해 그대로 복사할 필드들 (학생 관계는 제외)
-CARRY_OVER_PROPS = ["오늘 수업내용", "숙제+교재단어", "학원단어", "교재이름"]
+# 시간표 생성 시 교재 관계만 유지. 수업내용/숙제/시험 범위 및 날짜는 복사하지 않음.
+CARRY_OVER_PROPS = ["교재이름"]
 
 # 실행 시작 시 실제 스키마를 조회해서 채워지는 값들 (혹시 모를 이름 불일치 방지용 안전장치)
 BAN_PROP_TT: str = ""       # 시간표 DB의 "반 DB" 속성 실제 이름
@@ -111,6 +111,14 @@ def resolve_all_property_names() -> None:
     BAN_PROP_TT = resolve_property_name(tt_schema, "반 DB")
     BAN_PROP_DAILY = resolve_property_name(daily_schema, "반 DB")
     BAN_PROP_STUDENT = resolve_property_name(student_schema, "반 DB")
+    # 관계 대상 DB가 Integration에 연결되지 않으면 관계가 누락될 수 있다.
+    # 빈 강사로 생성하기 전에 읽기 가능 여부를 확인한다.
+    teacher_prop = tt_schema.get("properties", {}).get("강사DB", {})
+    teacher_db = teacher_prop.get("relation", {}).get("database_id")
+    if teacher_prop.get("type") != "relation" or not teacher_db:
+        raise RuntimeError("시간표 강사DB 관계를 읽을 수 없습니다. GitHub NOTION_TOKEN의 Integration 연결을 확인하세요.")
+    get_database_schema(teacher_db)
+
     STUDENT_STATUS_TYPE = student_schema["properties"]["상태"]["type"]
     if STUDENT_STATUS_TYPE not in ("select", "status"):
         raise RuntimeError("학생 상태 속성은 select 또는 status여야 합니다.")
@@ -329,6 +337,20 @@ def step1_generate_timetable(today: date) -> list[dict]:
         existing_keys.add(key)
         existing_by_key[key] = row
 
+    # 기존 담당은 유지하고, 담당이 필요한 행만 지난주 자료로 검증한다.
+    # 같은 반/시간에 서로 다른 강사가 있으면 임의로 첫 강사를 고르지 않는다.
+    source_teachers = {}
+    for src in source_rows:
+        key = (tuple(sorted(_normalize_id(i) for i in get_relation_ids(src, BAN_PROP_TT))), get_select_name(src, "시간"))
+        ids = get_relation_ids(src, "강사DB")
+        source_teachers.setdefault(key, set()).add(tuple(sorted(_normalize_id(i) for i in ids)))
+    for key, choices in source_teachers.items():
+        existing = existing_by_key.get(key)
+        if existing is not None and get_relation_ids(existing, "강사DB"):
+            continue
+        if len(choices) != 1 or not next(iter(choices)):
+            raise RuntimeError(f"강사DB가 비어 있거나 지난주 강사가 서로 달라 생성/보완할 수 없습니다: {key}. 원본과 Integration 접근을 확인하세요.")
+
     today_rows = list(existing_today)
 
     for src in source_rows:
@@ -341,6 +363,8 @@ def step1_generate_timetable(today: date) -> list[dict]:
             # (강사DB 로직이 없던 예전 버전 스크립트가 먼저 만들어둔 행을 복구하기 위함)
             existing_row = existing_by_key.get(key)
             if existing_row is not None:
+                if not get_select_name(existing_row, "요일"):
+                    patch_row(existing_row, {"요일": {"select": {"name": get_select_name(src, "요일") or "월화수목금토일"[today.weekday()]}}})
                 existing_teacher_ids = get_relation_ids(existing_row, "강사DB")
                 src_teacher_ids = get_relation_ids(src, "강사DB")
                 if not existing_teacher_ids and src_teacher_ids:
@@ -358,7 +382,7 @@ def step1_generate_timetable(today: date) -> list[dict]:
         }
         if time_slot:
             properties["시간"] = {"select": {"name": time_slot}}
-        weekday = get_select_name(src, "요일")
+        weekday = get_select_name(src, "요일") or "월화수목금토일"[today.weekday()]
         if weekday:
             properties["요일"] = {"select": {"name": weekday}}
         if ban_ids:
@@ -367,7 +391,7 @@ def step1_generate_timetable(today: date) -> list[dict]:
         if teacher_ids:
             properties["강사DB"] = {"relation": [{"id": i} for i in teacher_ids]}
 
-        # 진도/숙제처럼 이어지는 맥락 필드 복사
+        # 교재이름 관계만 복사
         for prop_name in CARRY_OVER_PROPS:
             src_prop = src.get("properties", {}).get(prop_name)
             if not src_prop:
@@ -378,15 +402,11 @@ def step1_generate_timetable(today: date) -> list[dict]:
             elif ptype == "relation" and src_prop.get("relation"):
                 properties[prop_name] = {"relation": src_prop["relation"]}
 
-        # 검사일/단어시험일이 지난주 기준으로 있었다면 1주 뒤로 밀어서 유지
+        # 명시적으로 비워 기본값이나 지난주 입력이 새 시간표에 이어지지 않게 한다.
+        for text_prop in ("오늘 수업내용", "숙제+교재단어", "학원단어"):
+            properties[text_prop] = {"rich_text": []}
         for date_prop in ("검사일", "단어시험일"):
-            start = get_date_start(src, date_prop)
-            if start:
-                try:
-                    d = date.fromisoformat(start[:10])
-                    properties[date_prop] = {"date": {"start": (d + timedelta(days=7)).isoformat()}}
-                except ValueError:
-                    pass
+            properties[date_prop] = {"date": None}
 
         properties["데이터생성"] = {"select": {"name": "생성완료"}}
 
