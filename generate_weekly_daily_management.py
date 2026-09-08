@@ -33,14 +33,14 @@
    문제가 없으면 DRY_RUN=0 으로 다시 돌리세요.
      DRY_RUN=1 python3 generate_weekly_daily_management.py
 
-스케줄링 예시 (GitHub Actions, 매주 일요일 21:00 KST = 12:00 UTC)
+스케줄링 예시 (GitHub Actions, 월~금 06:00 KST = 전날 21:00 UTC)
 ------------------------------------------------------------------
 .github/workflows/weekly_generate.yml 에:
 
     name: weekly-daily-management
     on:
       schedule:
-        - cron: "0 12 * * 0"
+        - cron: "0 21 * * 0-4"
       workflow_dispatch: {}
     jobs:
       run:
@@ -61,7 +61,9 @@ import os
 import sys
 import time
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
+from urllib.parse import urlencode
 from typing import Any, Optional
 
 import requests
@@ -95,11 +97,13 @@ CARRY_OVER_PROPS = ["오늘 수업내용", "숙제+교재단어", "학원단어"
 # 실행 시작 시 실제 스키마를 조회해서 채워지는 값들 (혹시 모를 이름 불일치 방지용 안전장치)
 BAN_PROP_TT: str = ""       # 시간표 DB의 "반 DB" 속성 실제 이름
 BAN_PROP_DAILY: str = ""    # 매일관리 DB의 "반 DB" 속성 실제 이름
+STUDENT_PROP_TT: Optional[str] = None
+STUDENT_STATUS_TYPE = "select"
 BAN_PROP_STUDENT: str = ""  # 학생 DB2의 "반 DB" 속성 실제 이름
 
 
 def resolve_all_property_names() -> None:
-    global BAN_PROP_TT, BAN_PROP_DAILY, BAN_PROP_STUDENT
+    global BAN_PROP_TT, BAN_PROP_DAILY, BAN_PROP_STUDENT, STUDENT_PROP_TT, STUDENT_STATUS_TYPE
     log.info("실제 속성명 조회 중 (이모지 제거 후 '반 DB'로 통일됨)...")
     tt_schema = get_database_schema(TIMETABLE_DB_ID)
     daily_schema = get_database_schema(DAILY_DB_ID)
@@ -107,6 +111,17 @@ def resolve_all_property_names() -> None:
     BAN_PROP_TT = resolve_property_name(tt_schema, "반 DB")
     BAN_PROP_DAILY = resolve_property_name(daily_schema, "반 DB")
     BAN_PROP_STUDENT = resolve_property_name(student_schema, "반 DB")
+    STUDENT_STATUS_TYPE = student_schema["properties"]["상태"]["type"]
+    if STUDENT_STATUS_TYPE not in ("select", "status"):
+        raise RuntimeError("학생 상태 속성은 select 또는 status여야 합니다.")
+    student_relations = [name for name, prop in tt_schema["properties"].items()
+                         if prop.get("type") == "relation" and
+                         _normalize_id(prop["relation"].get("database_id", "")) == _normalize_id(STUDENT_DB_ID)]
+    if len(student_relations) > 1:
+        raise RuntimeError(f"시간표의 학생 관계가 여러 개입니다: {student_relations}")
+    STUDENT_PROP_TT = student_relations[0] if student_relations else None
+    if STUDENT_PROP_TT is None:
+        log.warning("시간표에 학생 DB2 직접 관계가 없어 매일관리의 학생 관계만 연결합니다.")
     log.info("  시간표: %r / 매일관리: %r / 학생DB2: %r", BAN_PROP_TT, BAN_PROP_DAILY, BAN_PROP_STUDENT)
 
 # 테스트용: TARGET_DATE 환경변수(YYYY-MM-DD)가 있으면 "오늘"을 그 날짜로 취급한다.
@@ -192,11 +207,13 @@ def resolve_property_name(schema: dict, keyword: str) -> str:
     이모지 앞글자가 눈으로는 같아 보여도 유니코드가 다를 수 있어,
     하드코딩 대신 항상 실제 API가 돌려준 속성 이름을 그대로 사용한다."""
     props = schema.get("properties", {})
+    if keyword in props:
+        return keyword
     matches = [name for name in props if keyword in name]
     if not matches:
         raise RuntimeError(f"'{keyword}' 포함 속성을 찾지 못함. 실제 속성명: {list(props.keys())}")
     if len(matches) > 1:
-        log.warning("  '%s' 포함 속성이 여러 개(%s) -> 첫 번째 사용: %s", keyword, matches, matches[0])
+        raise RuntimeError(f"{keyword!r} 속성이 여러 개여서 특정할 수 없음: {matches}")
     return matches[0]
 
 
@@ -226,9 +243,9 @@ def update_page(page_id: str, properties: dict) -> dict:
 
 def get_title_text(page: dict) -> str:
     for prop in page.get("properties", {}).values():
-        if prop.get("type") == "title":
+        if prop.get("type") == "title" or "title" in prop:
             parts = prop.get("title", [])
-            return "".join(p.get("plain_text", "") for p in parts)
+            return "".join(p.get("plain_text", p.get("text", {}).get("content", "")) for p in parts)
     return ""
 
 
@@ -236,6 +253,20 @@ def get_relation_ids(page: dict, prop_name: str) -> list[str]:
     prop = page.get("properties", {}).get(prop_name)
     if not prop or "relation" not in prop:
         return []
+    if prop.get("has_more"):
+        relations = []
+        cursor = None
+        while True:
+            params = {"page_size": 100}
+            if cursor:
+                params["start_cursor"] = cursor
+            data = _request("GET", f"/pages/{_normalize_id(page['id'])}/properties/{prop['id']}?{urlencode(params)}")
+            relations.extend(item["relation"] for item in data["results"])
+            if not data.get("has_more"):
+                break
+            cursor = data["next_cursor"]
+        prop["relation"] = relations
+        prop["has_more"] = False
     return [r["id"] for r in prop.get("relation", [])]
 
 
@@ -259,7 +290,7 @@ def get_rich_text(page: dict, prop_name: str) -> str:
     prop = page.get("properties", {}).get(prop_name)
     if not prop or "rich_text" not in prop:
         return ""
-    return "".join(p.get("plain_text", "") for p in prop.get("rich_text", []))
+    return "".join(p.get("plain_text", p.get("text", {}).get("content", "")) for p in prop.get("rich_text", []))
 
 
 def title_lookup(page_id: str) -> str:
@@ -293,7 +324,7 @@ def step1_generate_timetable(today: date) -> list[dict]:
     existing_keys = set()
     existing_by_key: dict[tuple, dict] = {}
     for row in existing_today:
-        ban = tuple(sorted(get_relation_ids(row, BAN_PROP_TT)))
+        ban = tuple(sorted(_normalize_id(i) for i in get_relation_ids(row, BAN_PROP_TT)))
         key = (ban, get_select_name(row, "시간"))
         existing_keys.add(key)
         existing_by_key[key] = row
@@ -303,7 +334,7 @@ def step1_generate_timetable(today: date) -> list[dict]:
     for src in source_rows:
         ban_ids = get_relation_ids(src, BAN_PROP_TT)
         time_slot = get_select_name(src, "시간")
-        key = (tuple(sorted(ban_ids)), time_slot)
+        key = (tuple(sorted(_normalize_id(i) for i in ban_ids)), time_slot)
         if key in existing_keys:
             # 이미 이번 주 행이 있으면 새로 만들지는 않되,
             # 강사DB가 비어 있는 기존 행이면 지난주 소스 기준으로 채워 넣는다.
@@ -313,7 +344,7 @@ def step1_generate_timetable(today: date) -> list[dict]:
                 existing_teacher_ids = get_relation_ids(existing_row, "강사DB")
                 src_teacher_ids = get_relation_ids(src, "강사DB")
                 if not existing_teacher_ids and src_teacher_ids:
-                    update_page(existing_row["id"], {
+                    patch_row(existing_row, {
                         "강사DB": {"relation": [{"id": i} for i in src_teacher_ids]}
                     })
                     log.info(
@@ -324,11 +355,12 @@ def step1_generate_timetable(today: date) -> list[dict]:
 
         properties: dict[str, Any] = {
             "출제일": {"date": {"start": today.isoformat()}},
-            "요일": {"select": {"name": get_select_name(src, "요일")}},
         }
         if time_slot:
             properties["시간"] = {"select": {"name": time_slot}}
-        strand_days = get_select_name(src, "요일")
+        weekday = get_select_name(src, "요일")
+        if weekday:
+            properties["요일"] = {"select": {"name": weekday}}
         if ban_ids:
             properties[BAN_PROP_TT] = {"relation": [{"id": i} for i in ban_ids]}
         teacher_ids = get_relation_ids(src, "강사DB")
@@ -362,6 +394,7 @@ def step1_generate_timetable(today: date) -> list[dict]:
         log.info("  생성됨: 반=%s 시간=%s -> page=%s", ban_ids, time_slot, new_page["id"])
         today_rows.append(new_page)
         existing_keys.add(key)
+        existing_by_key[key] = new_page
 
     log.info("STEP 1 완료: 오늘 기준 시간표 %d건", len(today_rows))
     return today_rows
@@ -378,71 +411,118 @@ def get_active_students_for_class(ban_id: str) -> list[dict]:
         filter_obj={
             "and": [
                 {"property": BAN_PROP_STUDENT, "relation": {"contains": ban_id}},
-                {"property": "상태", "select": {"equals": "재원"}},
+                {"property": "상태", STUDENT_STATUS_TYPE: {"equals": "재원"}},
             ]
         },
     )
 
 
+def patch_row(row: dict, properties: dict) -> None:
+    """성공한 쓰기를 메모리에도 반영해 후속 단계가 오래된 관계를 덮어쓰지 않게 한다."""
+    update_page(row["id"], properties)
+    row.setdefault("properties", {}).update(properties)
+
+
+def merge_relation(row: dict, name: str, ids: list[str]) -> bool:
+    existing = get_relation_ids(row, name)
+    seen = {_normalize_id(i) for i in existing}
+    merged = list(existing)
+    for item in ids:
+        if _normalize_id(item) not in seen:
+            merged.append(item)
+            seen.add(_normalize_id(item))
+    if merged == existing:
+        return False
+    patch_row(row, {name: {"relation": [{"id": i} for i in merged]}})
+    return True
+
+
+def daily_slot(value: Optional[str]) -> str:
+    if value in TIME_MAP:
+        return TIME_MAP[value]
+    if value in TIME_MAP.values():
+        return value
+    raise RuntimeError(f"수업시간 매핑을 확인해야 합니다: {value!r}")
+
+
 def step2_3_generate_daily(today: date, timetable_rows: list[dict]) -> list[dict]:
     log.info("STEP 2+3: 반 DB 기준 재원 학생 연결 + 매일관리 생성")
-
     existing_daily = query_database_all(
-        DAILY_DB_ID,
-        filter_obj={"property": "날짜", "date": {"equals": today.isoformat()}},
+        DAILY_DB_ID, filter_obj={"property": "날짜", "date": {"equals": today.isoformat()}},
     )
-    existing_keys = set()
+    by_student_slot = {}
     for row in existing_daily:
-        student_ids = get_relation_ids(row, "학생")
-        row_slot = get_select_name(row, "수업시간")
-        if student_ids:
-            existing_keys.add((student_ids[0], row_slot))
+        students = get_relation_ids(row, "학생")
+        if len(students) > 1:
+            raise RuntimeError(f"매일관리 한 행에 학생이 여러 명 연결됨: {row['id']}")
+        if students:
+            key = (_normalize_id(students[0]), get_select_name(row, "수업시간"))
+            if key in by_student_slot:
+                raise RuntimeError(f"동일 학생·시간의 매일관리 중복: {by_student_slot[key]['id']}, {row['id']}")
+            by_student_slot[key] = row
 
     created_rows = list(existing_daily)
+    class_cache = {}
+    title_cache = {}
+
+    def cached_title(page_id):
+        if page_id not in title_cache:
+            title_cache[page_id] = title_lookup(page_id)
+        return title_cache[page_id]
 
     for tt in timetable_rows:
         ban_ids = get_relation_ids(tt, BAN_PROP_TT)
         if not ban_ids:
+            log.warning("반 연결 없는 시간표 건너뜀: %s", tt["id"])
             continue
-        ban_id = ban_ids[0]
-        time_slot = get_select_name(tt, "시간")
+        daily_time = daily_slot(get_select_name(tt, "시간"))
         weekday = get_select_name(tt, "요일")
         teacher_ids = get_relation_ids(tt, "강사DB")
-
-        ban_title = title_lookup(ban_id)
-        daily_time = TIME_MAP.get(time_slot, time_slot or "")
-        teacher_title = title_lookup(teacher_ids[0]) if teacher_ids else ""
-
-        students = get_active_students_for_class(ban_id)
-        log.info("  반 [%s] 재원 학생 %d명", ban_title, len(students))
-
-        for stu in students:
-            stu_id = stu["id"]
-            dedup_key = (stu_id, daily_time)
-            if dedup_key in existing_keys:
-                continue  # 같은 학생의 같은 시간대 행이 이미 오늘 생성됨 (중복 방지)
-                # 주의: 같은 학생이라도 다른 시간대(예: 0720, 0840)면 별도로 생성됨
-
-            stu_name = get_title_text(stu)
-            row_title = f"{today.strftime('%Y.%m.%d')} | {daily_time} | {ban_title} | {stu_name} | {teacher_title}"
-
-            properties: dict[str, Any] = {
-                "이름": {"title": [{"text": {"content": row_title}}]},
-                "날짜": {"date": {"start": today.isoformat()}},
-                "학생": {"relation": [{"id": stu_id}]},
-                BAN_PROP_DAILY: {"relation": [{"id": ban_id}]},
-            }
-            if teacher_ids:
-                properties["담당"] = {"relation": [{"id": teacher_ids[0]}]}
-            if daily_time:
-                properties["수업시간"] = {"select": {"name": daily_time}}
-            if weekday:
-                properties["요일"] = {"select": {"name": weekday}}
-            properties["출제 시간표"] = {"relation": [{"id": tt["id"]}]}
-
-            new_row = create_page(DAILY_DB_ID, properties)
-            created_rows.append(new_row)
-            existing_keys.add(dedup_key)
+        all_students = {}
+        for ban_id in ban_ids:
+            if ban_id not in class_cache:
+                class_cache[ban_id] = get_active_students_for_class(ban_id)
+            students = class_cache[ban_id]
+            ban_title = cached_title(ban_id)
+            teacher_title = ", ".join(cached_title(i) for i in teacher_ids)
+            log.info("  반 [%s] 재원 학생 %d명", ban_title, len(students))
+            for stu in students:
+                stu_id = stu["id"]
+                all_students[_normalize_id(stu_id)] = stu_id
+                key = (_normalize_id(stu_id), daily_time)
+                existing = by_student_slot.get(key)
+                if existing is not None:
+                    current_classes = get_relation_ids(existing, BAN_PROP_DAILY)
+                    if current_classes and _normalize_id(ban_id) not in {_normalize_id(i) for i in current_classes}:
+                        raise RuntimeError(f"동일 학생·시간에 서로 다른 반이 지정됨: {existing['id']}, {tt['id']}")
+                    merge_relation(existing, BAN_PROP_DAILY, [ban_id])
+                    merge_relation(existing, "출제 시간표", [tt["id"]])
+                    if teacher_ids and not get_relation_ids(existing, "담당"):
+                        merge_relation(existing, "담당", teacher_ids)
+                    if weekday and not get_select_name(existing, "요일"):
+                        patch_row(existing, {"요일": {"select": {"name": weekday}}})
+                    continue
+                row_title = f"{today.strftime('%Y.%m.%d')} | {daily_time} | {ban_title} | {get_title_text(stu)} | {teacher_title}"
+                properties = {
+                    "이름": {"title": [{"text": {"content": row_title}}]},
+                    "날짜": {"date": {"start": today.isoformat()}},
+                    "학생": {"relation": [{"id": stu_id}]},
+                    BAN_PROP_DAILY: {"relation": [{"id": ban_id}]},
+                    "수업시간": {"select": {"name": daily_time}},
+                    "출제 시간표": {"relation": [{"id": tt["id"]}]},
+                }
+                if teacher_ids:
+                    properties["담당"] = {"relation": [{"id": i} for i in teacher_ids]}
+                if weekday:
+                    properties["요일"] = {"select": {"name": weekday}}
+                new_row = create_page(DAILY_DB_ID, properties)
+                created_rows.append(new_row)
+                by_student_slot[key] = new_row
+        if STUDENT_PROP_TT:
+            desired = set(all_students)
+            actual = {_normalize_id(i) for i in get_relation_ids(tt, STUDENT_PROP_TT)}
+            if desired != actual:
+                patch_row(tt, {STUDENT_PROP_TT: {"relation": [{"id": i} for i in all_students.values()]}})
 
     log.info("STEP 2+3 완료: 오늘 매일관리 총 %d건", len(created_rows))
     return created_rows
@@ -452,57 +532,53 @@ def step2_3_generate_daily(today: date, timetable_rows: list[dict]) -> list[dict
 # STEP 4: 검사일/단어시험일 기준 연결 추가 (새 행 생성 금지)
 # --------------------------------------------------------------------------
 
-def step4_link_exam_days(today: date, daily_rows: list[dict]) -> None:
+def step4_link_exam_days(today: date, daily_rows: list[dict], timetable_rows: Optional[list[dict]] = None) -> None:
     log.info("STEP 4: 검사일/단어시험일 기준 연결 추가")
-
-    # 오늘 매일관리 행을 (반, 수업시간) 기준으로 그룹핑
-    by_class_slot: dict[tuple, list[dict]] = {}
+    by_class_slot = {}
     for row in daily_rows:
-        ban_ids = get_relation_ids(row, BAN_PROP_DAILY)
-        if not ban_ids:
+        if (get_date_start(row, "날짜") or "")[:10] != today.isoformat():
             continue
-        slot = get_select_name(row, "수업시간")
-        by_class_slot.setdefault((ban_ids[0], slot), []).append(row)
+        for ban_id in get_relation_ids(row, BAN_PROP_DAILY):
+            slot = get_select_name(row, "수업시간")
+            by_class_slot.setdefault((_normalize_id(ban_id), slot), []).append(row)
 
-    for date_prop, daily_relation_prop in (("검사일", "검사일"), ("단어시험일", "단어시험일")):
+    for date_prop in ("검사일", "단어시험일"):
         matches = query_database_all(
-            TIMETABLE_DB_ID,
-            filter_obj={"property": date_prop, "date": {"equals": today.isoformat()}},
+            TIMETABLE_DB_ID, filter_obj={"property": date_prop, "date": {"equals": today.isoformat()}},
         )
-        log.info("  '%s'==오늘 인 시간표 %d건", date_prop, len(matches))
-
-        for tt in matches:
-            ban_ids = get_relation_ids(tt, BAN_PROP_TT)
-            if not ban_ids:
-                continue
-            ban_id = ban_ids[0]
-            tt_time_slot = get_select_name(tt, "시간")
-            daily_time = TIME_MAP.get(tt_time_slot, tt_time_slot or "")
-
-            targets = by_class_slot.get((ban_id, daily_time), [])
+        # 드라이런에서 생성된 시간표는 서버 조회에 없으므로 함께 검증한다.
+        unique_matches = {_normalize_id(tt["id"]): tt for tt in matches}
+        for tt in timetable_rows or []:
+            if get_date_start(tt, date_prop) == today.isoformat():
+                unique_matches[_normalize_id(tt["id"])] = tt
+        for tt in unique_matches.values():
+            daily_time = daily_slot(get_select_name(tt, "시간"))
+            targets = {}
+            for ban_id in get_relation_ids(tt, BAN_PROP_TT):
+                for row in by_class_slot.get((_normalize_id(ban_id), daily_time), []):
+                    targets[row["id"]] = row
             if not targets:
-                log.warning(
-                    "  [경고] 반=%s 시간=%s 에 해당하는 매일관리 행을 찾지 못함 (시간표=%s) - 건너뜀",
-                    title_lookup(ban_id), daily_time, tt["id"],
-                )
+                log.warning("검사/시험 연결 대상 없음: 속성=%s 시간=%s 시간표=%s", date_prop, daily_time, tt["id"])
                 continue
-
-            # 대표 학생 1건으로 담당/반 일치 검증
-            rep = targets[0]
-            rep_teacher = get_relation_ids(rep, "담당")
-            tt_teacher = get_relation_ids(tt, "강사DB")
-            if rep_teacher and tt_teacher and rep_teacher[0] != tt_teacher[0]:
-                log.warning("  [경고] 담당 불일치로 연결 보류: daily=%s timetable=%s", rep["id"], tt["id"])
-                continue
-
-            for row in targets:
-                existing_rel = get_relation_ids(row, daily_relation_prop)
-                if tt["id"] in existing_rel:
+            tt_teachers = {_normalize_id(i) for i in get_relation_ids(tt, "강사DB")}
+            linked = 0
+            for row in targets.values():
+                teachers = {_normalize_id(i) for i in get_relation_ids(row, "담당")}
+                if teachers and tt_teachers and not teachers.intersection(tt_teachers):
+                    log.warning("담당 불일치로 연결 보류: daily=%s timetable=%s", row["id"], tt["id"])
                     continue
-                update_page(row["id"], {
-                    daily_relation_prop: {"relation": [{"id": i} for i in existing_rel + [tt["id"]]]}
-                })
-            log.info("  연결 완료: 반=%s 시간=%s -> %d개 매일관리 행", title_lookup(ban_id), daily_time, len(targets))
+                if merge_relation(row, date_prop, [tt["id"]]):
+                    linked += 1
+            log.info("%s 연결 추가: 시간표=%s, %d건", date_prop, tt["id"], linked)
+
+
+def get_target_date(now: Optional[datetime] = None) -> date:
+    if _TARGET_DATE_OVERRIDE:
+        return date.fromisoformat(_TARGET_DATE_OVERRIDE)
+    current = now if now is not None else datetime.now(ZoneInfo("Asia/Seoul"))
+    if current.tzinfo is None:
+        raise ValueError("시간대가 있는 datetime이 필요합니다.")
+    return current.astimezone(ZoneInfo("Asia/Seoul")).date()
 
 
 # --------------------------------------------------------------------------
@@ -510,18 +586,14 @@ def step4_link_exam_days(today: date, daily_rows: list[dict]) -> None:
 # --------------------------------------------------------------------------
 
 def main():
-    if _TARGET_DATE_OVERRIDE:
-        today = date.fromisoformat(_TARGET_DATE_OVERRIDE)
-        log.info("[TEST MODE] TARGET_DATE 지정됨 -> 오늘을 %s 로 취급", today)
-    else:
-        today = date.today()
+    today = get_target_date()
     log.info("=== 실행 시작: %s (DRY_RUN=%s) ===", today, DRY_RUN)
 
     resolve_all_property_names()
 
     timetable_rows = step1_generate_timetable(today)
     daily_rows = step2_3_generate_daily(today, timetable_rows)
-    step4_link_exam_days(today, daily_rows)
+    step4_link_exam_days(today, daily_rows, timetable_rows)
 
     log.info("=== 실행 완료 ===")
 
