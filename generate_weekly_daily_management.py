@@ -111,13 +111,14 @@ def resolve_all_property_names() -> None:
     BAN_PROP_TT = resolve_property_name(tt_schema, "반 DB")
     BAN_PROP_DAILY = resolve_property_name(daily_schema, "반 DB")
     BAN_PROP_STUDENT = resolve_property_name(student_schema, "반 DB")
-    # 관계 대상 DB가 Integration에 연결되지 않으면 관계가 누락될 수 있다.
-    # 빈 강사로 생성하기 전에 읽기 가능 여부를 확인한다.
+    # 강사DB는 relation 속성인지 확인하되, 관계 대상 DB ID 노출 여부로 실행을 막지 않는다.
+    # Notion은 연결 권한/응답 형태에 따라 relation 설정의 database_id를 생략할 수 있다.
+    # 실제 강사 관계 값은 STEP 1에서 소스 행별로 검증하므로 빈 강사 데이터는 생성되지 않는다.
     teacher_prop = tt_schema.get("properties", {}).get("강사DB", {})
-    teacher_db = teacher_prop.get("relation", {}).get("database_id")
-    if teacher_prop.get("type") != "relation" or not teacher_db:
-        raise RuntimeError("시간표 강사DB 관계를 읽을 수 없습니다. GitHub NOTION_TOKEN의 Integration 연결을 확인하세요.")
-    get_database_schema(teacher_db)
+    if teacher_prop.get("type") != "relation":
+        raise RuntimeError("시간표의 강사DB 속성이 relation이 아닙니다. 속성 유형을 확인하세요.")
+    if not teacher_prop.get("relation", {}).get("database_id"):
+        log.warning("강사DB 관계 대상 ID가 API 응답에 없지만 행의 관계 값 검증을 계속합니다.")
 
     STUDENT_STATUS_TYPE = student_schema["properties"]["상태"]["type"]
     if STUDENT_STATUS_TYPE not in ("select", "status"):

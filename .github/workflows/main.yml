@@ -1,6 +1,12 @@
 name: weekly-daily-management
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - "generate_weekly_daily_management.py"
+      - "tests/**"
+      - ".github/workflows/main.yml"
   schedule:
     # 매주 월~금 새벽 6:00 KST = 전날 21:00 UTC (수업 시작 전 여유있게 생성)
     # cron 요일: 0=일, 1=월, 2=화, 3=수, 4=목, 5=금, 6=토
