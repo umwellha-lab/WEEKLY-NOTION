@@ -144,6 +144,24 @@ class GenerationTests(unittest.TestCase):
             result = g.step1_generate_timetable(TODAY)
         self.assertEqual(g.get_relation_ids(result[0], "교재이름"), ["book1"])
 
+    def test_temporary_class_replaces_normal_class_from_another_timetable(self):
+        target = daily()
+        target["properties"]["출제 시간표"] = rel("tt-normal")
+        student = row("student1", 이름={"title": [{"text": {"content": "Student"}}]})
+        source = timetable("tt-temp", teacher="teacher2")
+        source["properties"]["반"] = rel("class2")
+        titles = {"class1": "76-고1", "class2": "[임시] 76 E", "teacher2": "Elena T"}
+        with patch.object(g, "query_database_all", return_value=[target]), \
+                patch.object(g, "get_active_students_for_class", return_value=[student]), \
+                patch.object(g, "title_lookup", side_effect=lambda page_id: titles[page_id]), \
+                patch.object(g, "update_page"):
+            result = g.step2_3_generate_daily(TODAY, [source])
+        self.assertEqual(len(result), 1)
+        self.assertEqual(g.get_relation_ids(target, "반"), ["class2"])
+        self.assertEqual(g.get_relation_ids(target, "출제 시간표"), ["tt-temp"])
+        self.assertEqual(g.get_relation_ids(target, "담당"), ["teacher2"])
+        self.assertIn("[임시] 76 E", g.get_title_text(target))
+
     def test_two_slots_create_two_rows_and_connect_students(self):
         student = row("student1", 이름={"title": [{"text": {"content": "Test"}}]})
         slots = [timetable(), timetable("tt2", slot="8시 40")]

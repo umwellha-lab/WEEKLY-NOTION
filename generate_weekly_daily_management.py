@@ -535,8 +535,40 @@ def step2_3_generate_daily(today: date, timetable_rows: list[dict]) -> list[dict
                         }
                     )
                     if has_different_class and not same_timetable:
+                        current_is_temporary = any(
+                            "임시" in cached_title(i) for i in current_classes
+                        )
+                        new_is_temporary = "임시" in ban_title
+                        if new_is_temporary and not current_is_temporary:
+                            row_title = (
+                                f"{today.strftime('%Y.%m.%d')} | {daily_time} | "
+                                f"{ban_title} | {get_title_text(stu)} | {teacher_title}"
+                            )
+                            replacement = {
+                                BAN_PROP_DAILY: {"relation": [{"id": ban_id}]},
+                                "출제 시간표": {"relation": [{"id": tt["id"]}]},
+                                "이름": {"title": [{"text": {"content": row_title}}]},
+                            }
+                            if teacher_ids:
+                                replacement["담당"] = {
+                                    "relation": [{"id": i} for i in teacher_ids]
+                                }
+                            if weekday:
+                                replacement["요일"] = {"select": {"name": weekday}}
+                            patch_row(existing, replacement)
+                            log.info(
+                                "  서로 다른 시간표 충돌: 임시반으로 교체 daily=%s, 반=%s",
+                                existing["id"], ban_title,
+                            )
+                            continue
+                        if current_is_temporary:
+                            log.info(
+                                "  서로 다른 시간표 충돌: 기존 임시반 유지 daily=%s",
+                                existing["id"],
+                            )
+                            continue
                         raise RuntimeError(
-                            f"동일 학생·시간에 서로 다른 시간표가 지정됨: "
+                            f"동일 학생·시간에 일반반 시간표가 중복됨: "
                             f"{existing['id']}, {tt['id']}"
                         )
                     if has_different_class and same_timetable:
