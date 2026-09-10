@@ -162,6 +162,19 @@ class GenerationTests(unittest.TestCase):
         self.assertEqual(g.get_relation_ids(target, "담당"), ["teacher2"])
         self.assertIn("[임시] 76 E", g.get_title_text(target))
 
+    def test_duplicate_timetable_for_same_class_keeps_first_relation(self):
+        target = daily()
+        target["properties"]["출제 시간표"] = rel("tt-first")
+        student = row("student1", 이름={"title": [{"text": {"content": "Student"}}]})
+        source = timetable("tt-second")
+        with patch.object(g, "query_database_all", return_value=[target]), \
+                patch.object(g, "get_active_students_for_class", return_value=[student]), \
+                patch.object(g, "title_lookup", return_value="Test"), \
+                patch.object(g, "update_page"):
+            result = g.step2_3_generate_daily(TODAY, [source])
+        self.assertEqual(len(result), 1)
+        self.assertEqual(g.get_relation_ids(target, "출제 시간표"), ["tt-first"])
+
     def test_two_slots_create_two_rows_and_connect_students(self):
         student = row("student1", 이름={"title": [{"text": {"content": "Test"}}]})
         slots = [timetable(), timetable("tt2", slot="8시 40")]

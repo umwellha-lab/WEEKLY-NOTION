@@ -534,7 +534,7 @@ def step2_3_generate_daily(today: date, timetable_rows: list[dict]) -> list[dict
                             _normalize_id(i) for i in current_classes
                         }
                     )
-                    if has_different_class and not same_timetable:
+                    if not same_timetable:
                         current_is_temporary = any(
                             "임시" in cached_title(i) for i in current_classes
                         )
@@ -564,6 +564,12 @@ def step2_3_generate_daily(today: date, timetable_rows: list[dict]) -> list[dict
                         if current_is_temporary:
                             log.info(
                                 "  서로 다른 시간표 충돌: 기존 임시반 유지 daily=%s",
+                                existing["id"],
+                            )
+                            continue
+                        if not has_different_class:
+                            log.info(
+                                "  동일 반·시간 중복 시간표: 기존 시간표 유지 daily=%s",
                                 existing["id"],
                             )
                             continue
