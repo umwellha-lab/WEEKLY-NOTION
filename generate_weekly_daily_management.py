@@ -528,6 +528,12 @@ def step2_3_generate_daily(today: date, timetable_rows: list[dict]) -> list[dict
                         _normalize_id(i) for i in get_relation_ids(existing, "출제 시간표")
                     }
                     same_timetable = _normalize_id(tt["id"]) in current_timetables
+                    if not current_timetables:
+                        patch_row(existing, {
+                            "출제 시간표": {"relation": [{"id": tt["id"]}]}
+                        })
+                        current_timetables.add(_normalize_id(tt["id"]))
+                        same_timetable = True
                     has_different_class = (
                         current_classes
                         and _normalize_id(ban_id) not in {
