@@ -115,18 +115,34 @@ class GenerationTests(unittest.TestCase):
             self.assertEqual(update.call_count, count)
             create.assert_not_called()
 
-    def test_shared_student_in_two_classes_of_same_timetable_is_merged(self):
+    def test_shared_student_in_normal_and_temporary_class_prefers_temporary(self):
         student = row("student1", 이름={"title": [{"text": {"content": "Test"}}]})
         source = timetable()
         source["properties"]["반"] = rel("class1", "class2")
+        titles = {
+            "class1": "76-고1",
+            "class2": "[임시] 76 T",
+            "teacher1": "Ted T",
+        }
         with patch.object(g, "query_database_all", return_value=[]), \
                 patch.object(g, "get_active_students_for_class", return_value=[student]), \
-                patch.object(g, "title_lookup", return_value="Test"), \
+                patch.object(g, "title_lookup", side_effect=lambda page_id: titles[page_id]), \
                 patch.object(g, "update_page"):
             result = g.step2_3_generate_daily(TODAY, [source])
         self.assertEqual(len(result), 1)
-        self.assertEqual(g.get_relation_ids(result[0], "반"), ["class1", "class2"])
+        self.assertEqual(g.get_relation_ids(result[0], "반"), ["class2"])
+        self.assertIn("[임시] 76 T", g.get_title_text(result[0]))
         self.assertEqual(g.get_relation_ids(result[0], "출제 시간표"), ["tt1"])
+
+    def test_existing_timetable_backfills_textbook_relation(self):
+        source = timetable()
+        source["properties"]["교재이름"] = rel("book1")
+        existing = timetable()
+        existing["properties"]["교재이름"] = rel()
+        with patch.object(g, "query_database_all", side_effect=[[source], [existing]]), \
+                patch.object(g, "update_page"):
+            result = g.step1_generate_timetable(TODAY)
+        self.assertEqual(g.get_relation_ids(result[0], "교재이름"), ["book1"])
 
     def test_two_slots_create_two_rows_and_connect_students(self):
         student = row("student1", 이름={"title": [{"text": {"content": "Test"}}]})

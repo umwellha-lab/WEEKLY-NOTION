@@ -376,6 +376,16 @@ def step1_generate_timetable(today: date) -> list[dict]:
                         "  강사DB 백필: 반=%s 시간=%s -> page=%s",
                         ban_ids, time_slot, existing_row["id"],
                     )
+                existing_book_ids = get_relation_ids(existing_row, "교재이름")
+                src_book_ids = get_relation_ids(src, "교재이름")
+                if not existing_book_ids and src_book_ids:
+                    patch_row(existing_row, {
+                        "교재이름": {"relation": [{"id": i} for i in src_book_ids]}
+                    })
+                    log.info(
+                        "  교재이름 백필: 반=%s 시간=%s -> page=%s",
+                        ban_ids, time_slot, existing_row["id"],
+                    )
             continue  # 이미 이번 주 것이 있으면 새 행은 만들지 않음 (중복 생성 방지)
 
         properties: dict[str, Any] = {
@@ -518,19 +528,42 @@ def step2_3_generate_daily(today: date, timetable_rows: list[dict]) -> list[dict
                         _normalize_id(i) for i in get_relation_ids(existing, "출제 시간표")
                     }
                     same_timetable = _normalize_id(tt["id"]) in current_timetables
-                    if (
+                    has_different_class = (
                         current_classes
                         and _normalize_id(ban_id) not in {
                             _normalize_id(i) for i in current_classes
                         }
-                        and not same_timetable
-                    ):
+                    )
+                    if has_different_class and not same_timetable:
                         raise RuntimeError(
                             f"동일 학생·시간에 서로 다른 시간표가 지정됨: "
                             f"{existing['id']}, {tt['id']}"
                         )
-                    # 하나의 시간표에 복수 반이 연결된 경우 같은 학생 행에 반만 병합한다.
-                    merge_relation(existing, BAN_PROP_DAILY, [ban_id])
+                    if has_different_class and same_timetable:
+                        current_is_temporary = any(
+                            "임시" in cached_title(i) for i in current_classes
+                        )
+                        new_is_temporary = "임시" in ban_title
+                        if new_is_temporary and not current_is_temporary:
+                            row_title = (
+                                f"{today.strftime('%Y.%m.%d')} | {daily_time} | "
+                                f"{ban_title} | {get_title_text(stu)} | {teacher_title}"
+                            )
+                            patch_row(existing, {
+                                BAN_PROP_DAILY: {"relation": [{"id": ban_id}]},
+                                "이름": {"title": [{"text": {"content": row_title}}]},
+                            })
+                            log.info(
+                                "  동일 시간표 공통 학생: 임시반 우선 daily=%s, 반=%s",
+                                existing["id"], ban_title,
+                            )
+                        else:
+                            log.info(
+                                "  동일 시간표 공통 학생: 기존 임시반 유지 daily=%s",
+                                existing["id"],
+                            )
+                    else:
+                        merge_relation(existing, BAN_PROP_DAILY, [ban_id])
                     merge_relation(existing, "출제 시간표", [tt["id"]])
                     if teacher_ids and not get_relation_ids(existing, "담당"):
                         merge_relation(existing, "담당", teacher_ids)
