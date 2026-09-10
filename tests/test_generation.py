@@ -115,6 +115,19 @@ class GenerationTests(unittest.TestCase):
             self.assertEqual(update.call_count, count)
             create.assert_not_called()
 
+    def test_shared_student_in_two_classes_of_same_timetable_is_merged(self):
+        student = row("student1", 이름={"title": [{"text": {"content": "Test"}}]})
+        source = timetable()
+        source["properties"]["반"] = rel("class1", "class2")
+        with patch.object(g, "query_database_all", return_value=[]), \
+                patch.object(g, "get_active_students_for_class", return_value=[student]), \
+                patch.object(g, "title_lookup", return_value="Test"), \
+                patch.object(g, "update_page"):
+            result = g.step2_3_generate_daily(TODAY, [source])
+        self.assertEqual(len(result), 1)
+        self.assertEqual(g.get_relation_ids(result[0], "반"), ["class1", "class2"])
+        self.assertEqual(g.get_relation_ids(result[0], "출제 시간표"), ["tt1"])
+
     def test_two_slots_create_two_rows_and_connect_students(self):
         student = row("student1", 이름={"title": [{"text": {"content": "Test"}}]})
         slots = [timetable(), timetable("tt2", slot="8시 40")]

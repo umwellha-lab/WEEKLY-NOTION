@@ -514,8 +514,22 @@ def step2_3_generate_daily(today: date, timetable_rows: list[dict]) -> list[dict
                 existing = by_student_slot.get(key)
                 if existing is not None:
                     current_classes = get_relation_ids(existing, BAN_PROP_DAILY)
-                    if current_classes and _normalize_id(ban_id) not in {_normalize_id(i) for i in current_classes}:
-                        raise RuntimeError(f"동일 학생·시간에 서로 다른 반이 지정됨: {existing['id']}, {tt['id']}")
+                    current_timetables = {
+                        _normalize_id(i) for i in get_relation_ids(existing, "출제 시간표")
+                    }
+                    same_timetable = _normalize_id(tt["id"]) in current_timetables
+                    if (
+                        current_classes
+                        and _normalize_id(ban_id) not in {
+                            _normalize_id(i) for i in current_classes
+                        }
+                        and not same_timetable
+                    ):
+                        raise RuntimeError(
+                            f"동일 학생·시간에 서로 다른 시간표가 지정됨: "
+                            f"{existing['id']}, {tt['id']}"
+                        )
+                    # 하나의 시간표에 복수 반이 연결된 경우 같은 학생 행에 반만 병합한다.
                     merge_relation(existing, BAN_PROP_DAILY, [ban_id])
                     merge_relation(existing, "출제 시간표", [tt["id"]])
                     if teacher_ids and not get_relation_ids(existing, "담당"):
