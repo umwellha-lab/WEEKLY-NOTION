@@ -17,15 +17,15 @@ def row(pid, **props):
     return {"id": pid, "properties": props}
 
 
-def timetable(pid="tt1", teacher="teacher1", slot="7시 20"):
-    return row(pid, 반=rel("class1"), 시간={"select": {"name": slot}},
+def timetable(pid="tt1", teacher="teacher1", slot="7시 20", class_id="class1"):
+    return row(pid, 반=rel(class_id), 시간={"select": {"name": slot}},
                강사DB=rel(teacher), 요일={"select": {"name": "화"}},
                검사일={"date": {"start": TODAY.isoformat()}},
                단어시험일={"date": {"start": TODAY.isoformat()}})
 
 
-def daily(pid="daily1", teacher="teacher1"):
-    return row(pid, 반=rel("class1"), 학생=rel("student1"), 담당=rel(teacher),
+def daily(pid="daily1", teacher="teacher1", class_id="class1"):
+    return row(pid, 반=rel(class_id), 학생=rel("student1"), 담당=rel(teacher),
                수업시간={"select": {"name": "0720"}},
                날짜={"date": {"start": TODAY.isoformat()}})
 
@@ -115,66 +115,6 @@ class GenerationTests(unittest.TestCase):
             self.assertEqual(update.call_count, count)
             create.assert_not_called()
 
-    def test_shared_student_in_normal_and_temporary_class_prefers_temporary(self):
-        student = row("student1", 이름={"title": [{"text": {"content": "Test"}}]})
-        source = timetable()
-        source["properties"]["반"] = rel("class1", "class2")
-        titles = {
-            "class1": "76-고1",
-            "class2": "[임시] 76 T",
-            "teacher1": "Ted T",
-        }
-        with patch.object(g, "query_database_all", return_value=[]), \
-                patch.object(g, "get_active_students_for_class", return_value=[student]), \
-                patch.object(g, "title_lookup", side_effect=lambda page_id: titles[page_id]), \
-                patch.object(g, "update_page"):
-            result = g.step2_3_generate_daily(TODAY, [source])
-        self.assertEqual(len(result), 1)
-        self.assertEqual(g.get_relation_ids(result[0], "반"), ["class2"])
-        self.assertIn("[임시] 76 T", g.get_title_text(result[0]))
-        self.assertEqual(g.get_relation_ids(result[0], "출제 시간표"), ["tt1"])
-
-    def test_existing_timetable_backfills_textbook_relation(self):
-        source = timetable()
-        source["properties"]["교재이름"] = rel("book1")
-        existing = timetable()
-        existing["properties"]["교재이름"] = rel()
-        with patch.object(g, "query_database_all", side_effect=[[source], [existing]]), \
-                patch.object(g, "update_page"):
-            result = g.step1_generate_timetable(TODAY)
-        self.assertEqual(g.get_relation_ids(result[0], "교재이름"), ["book1"])
-
-    def test_temporary_class_replaces_normal_class_from_another_timetable(self):
-        target = daily()
-        target["properties"]["출제 시간표"] = rel("tt-normal")
-        student = row("student1", 이름={"title": [{"text": {"content": "Student"}}]})
-        source = timetable("tt-temp", teacher="teacher2")
-        source["properties"]["반"] = rel("class2")
-        titles = {"class1": "76-고1", "class2": "[임시] 76 E", "teacher2": "Elena T"}
-        with patch.object(g, "query_database_all", return_value=[target]), \
-                patch.object(g, "get_active_students_for_class", return_value=[student]), \
-                patch.object(g, "title_lookup", side_effect=lambda page_id: titles[page_id]), \
-                patch.object(g, "update_page"):
-            result = g.step2_3_generate_daily(TODAY, [source])
-        self.assertEqual(len(result), 1)
-        self.assertEqual(g.get_relation_ids(target, "반"), ["class2"])
-        self.assertEqual(g.get_relation_ids(target, "출제 시간표"), ["tt-temp"])
-        self.assertEqual(g.get_relation_ids(target, "담당"), ["teacher2"])
-        self.assertIn("[임시] 76 E", g.get_title_text(target))
-
-    def test_duplicate_timetable_for_same_class_keeps_first_relation(self):
-        target = daily()
-        target["properties"]["출제 시간표"] = rel("tt-first")
-        student = row("student1", 이름={"title": [{"text": {"content": "Student"}}]})
-        source = timetable("tt-second")
-        with patch.object(g, "query_database_all", return_value=[target]), \
-                patch.object(g, "get_active_students_for_class", return_value=[student]), \
-                patch.object(g, "title_lookup", return_value="Test"), \
-                patch.object(g, "update_page"):
-            result = g.step2_3_generate_daily(TODAY, [source])
-        self.assertEqual(len(result), 1)
-        self.assertEqual(g.get_relation_ids(target, "출제 시간표"), ["tt-first"])
-
     def test_two_slots_create_two_rows_and_connect_students(self):
         student = row("student1", 이름={"title": [{"text": {"content": "Test"}}]})
         slots = [timetable(), timetable("tt2", slot="8시 40")]
@@ -184,6 +124,97 @@ class GenerationTests(unittest.TestCase):
         self.assertEqual(students.call_count, 1)
         for tt in slots:
             self.assertEqual(g.get_relation_ids(tt, "수강생"), ["student1"])
+
+    def test_temporary_class_wins_before_timetable_roster_and_daily_creation(self):
+        student = row("student1", 이름={"title": [{"text": {"content": "장민준"}}]})
+        mixed = timetable("mixed-tt", class_id="normal-class")
+        mixed["properties"]["반"] = rel("normal-class", "temp-class")
+
+        def class_students(_class_id):
+            return [student]
+
+        def page_title(page_id):
+            return {
+                "normal-class": "45-중1",
+                "temp-class": "[임시] 환서1 32/46",
+                "teacher1": "Teacher",
+            }.get(page_id, page_id)
+
+        with patch.object(g, "query_database_all", return_value=[]), \
+                patch.object(g, "get_active_students_for_class", side_effect=class_students), \
+                patch.object(g, "title_lookup", side_effect=page_title), \
+                patch.object(g, "STUDENT_PROP_TT", "학생 DB1"), \
+                patch.object(g, "update_page"):
+            rows = g.step2_3_generate_daily(TODAY, [mixed])
+
+        self.assertEqual(g.get_relation_ids(mixed, "학생 DB1"), ["student1"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(g.get_relation_ids(rows[0], "반"), ["temp-class"])
+        self.assertEqual(g.get_relation_ids(rows[0], "출제 시간표"), ["mixed-tt"])
+
+    def test_existing_normal_daily_is_corrected_to_temporary_without_new_row(self):
+        student = row("student1", 이름={"title": [{"text": {"content": "장민준"}}]})
+        existing = daily(class_id="normal-class")
+        existing["properties"]["출제 시간표"] = rel("normal-tt")
+        normal = timetable("normal-tt", class_id="normal-class")
+        temporary = timetable("temp-tt", teacher="temp-teacher", class_id="temp-class")
+
+        def page_title(page_id):
+            return {
+                "normal-class": "45-중1",
+                "temp-class": "[금] 천재이 1",
+                "teacher1": "Normal Teacher",
+                "temp-teacher": "Temp Teacher",
+            }.get(page_id, page_id)
+
+        with patch.object(g, "query_database_all", return_value=[existing]), \
+                patch.object(g, "get_active_students_for_class", return_value=[student]), \
+                patch.object(g, "title_lookup", side_effect=page_title), \
+                patch.object(g, "update_page"), patch.object(g, "create_page") as create:
+            rows = g.step2_3_generate_daily(TODAY, [normal, temporary])
+
+        create.assert_not_called()
+        self.assertEqual(rows, [existing])
+        self.assertEqual(g.get_relation_ids(existing, "반"), ["temp-class"])
+        self.assertEqual(g.get_relation_ids(existing, "담당"), ["temp-teacher"])
+        self.assertEqual(g.get_relation_ids(existing, "출제 시간표"), ["temp-tt"])
+
+    def test_two_temporary_classes_same_slot_are_reported_and_not_generated(self):
+        student = row("student1", 이름={"title": [{"text": {"content": "장민준"}}]})
+        first = timetable("temp-1", class_id="class-a")
+        second = timetable("temp-2", class_id="class-b")
+
+        def page_title(page_id):
+            return {"class-a": "[임시] A", "class-b": "[임시] B"}.get(page_id, page_id)
+
+        with patch.object(g, "query_database_all", return_value=[]), \
+                patch.object(g, "get_active_students_for_class", return_value=[student]), \
+                patch.object(g, "title_lookup", side_effect=page_title), \
+                patch.object(g, "STUDENT_PROP_TT", "학생 DB1"), \
+                patch.object(g, "update_page"), patch.object(g, "create_page") as create:
+            rows = g.step2_3_generate_daily(TODAY, [first, second])
+
+        create.assert_not_called()
+        self.assertEqual(rows, [])
+        self.assertEqual(g.get_relation_ids(first, "학생 DB1"), [])
+        self.assertEqual(g.get_relation_ids(second, "학생 DB1"), [])
+
+    def test_existing_duplicate_blocks_only_that_student_slot(self):
+        duplicate_a = daily("duplicate-a")
+        duplicate_b = daily("duplicate-b")
+        other_student = row("student2", 이름={"title": [{"text": {"content": "Other"}}]})
+        target_timetable = timetable()
+
+        with patch.object(g, "query_database_all", return_value=[duplicate_a, duplicate_b]), \
+                patch.object(g, "get_active_students_for_class", return_value=[
+                    row("student1", 이름={"title": [{"text": {"content": "Duplicate"}}]}),
+                    other_student,
+                ]), patch.object(g, "title_lookup", return_value="Test"), \
+                patch.object(g, "update_page"):
+            rows = g.step2_3_generate_daily(TODAY, [target_timetable])
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(g.get_relation_ids(rows[0], "학생"), ["student2"])
 
     def test_timetable_teacher_backfill_visible_in_returned_rows(self):
         existing = timetable()
