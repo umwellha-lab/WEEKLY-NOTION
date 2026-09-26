@@ -177,7 +177,7 @@ def validate_schema(client):
                 '결석 체크': 'checkbox', '재시험 완료': 'checkbox',
                 **{x: 'number' for x in SCORES.values()}},
         REPORTS: {'성과표': 'title', '학생': 'relation', '집계키': 'rich_text',
-                  '보고 기간': 'date', '상태': 'select'},
+                  '보고 기간': 'date', '상태': 'select', '게시 여부': 'checkbox'},
     }
     for source, props in needed.items():
         for name, kind in props.items():
@@ -241,12 +241,14 @@ def sync(client, start, end, today, write=False):
                 raise SafeError('성과표 속성 유형이 집계 코드와 다릅니다.')
         key = props['집계키']['rich_text'][0]['text']['content']
         previous = index.get(key)
-        if previous and field(previous, '상태') in LOCKED:
+        if previous and (field(previous, '상태') in LOCKED or field(previous, '게시 여부')):
             counts['locked'] += 1
             continue
         if previous:
             # Never modify reviewer status, teacher comments, next goals, or page body.
             props.pop('상태')
+        else:
+            props['게시 여부'] = {'checkbox': False}
         operations.append((previous, props))
     # All input is checked before the first mutation.
     for previous, props in operations:

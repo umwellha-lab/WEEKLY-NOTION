@@ -36,7 +36,8 @@ def aggregate(rows):
 
 def as_page(properties):
     return {'id': 'b' * 32, 'properties': {
-        k: {'type': next(iter(v)), **copy.deepcopy(v)} for k, v in properties.items()}}
+        **{k: {'type': next(iter(v)), **copy.deepcopy(v)} for k, v in properties.items()},
+        '게시 여부': prop('checkbox', False)}}
 
 
 class FakeNotion:
@@ -132,6 +133,13 @@ class ReportsTests(unittest.TestCase):
             self.assertEqual(client.writes, [])
         client = FakeNotion()
         self.run_sync(client, False)
+        self.assertEqual(client.writes, [])
+
+    def test_publication_checkbox_locks_row(self):
+        report = as_page(aggregate([]))
+        report['properties']['게시 여부'] = prop('checkbox', True)
+        client = FakeNotion([report])
+        self.assertEqual(self.run_sync(client, True)['locked'], 1)
         self.assertEqual(client.writes, [])
 
     def test_duplicates_fail_before_writes(self):
