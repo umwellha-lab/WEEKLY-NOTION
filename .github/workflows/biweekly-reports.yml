@@ -1,0 +1,64 @@
+name: biweekly-reports
+
+on:
+  workflow_dispatch:
+    inputs:
+      period_start:
+        description: '시작일 YYYY-MM-DD (빈 값: 최근 완료된 2주)'
+        type: string
+        default: ''
+      apply_changes:
+        description: '실제 노션 반영 (해제하면 검증만)'
+        type: boolean
+        default: false
+  schedule:
+    # Monday 07:17 KST. Python gates alternate weeks from 2026-09-14.
+    - cron: '17 22 * * 0'
+  pull_request:
+    paths:
+      - 'generate_biweekly_reports.py'
+      - 'biweekly_tests/**'
+      - '.github/workflows/biweekly-reports.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: notion-biweekly-reports
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m unittest discover -s biweekly_tests -v
+
+  aggregate:
+    needs: test
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && vars.BIWEEKLY_ENABLED == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Aggregate approved source data
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_STUDENTS_SOURCE_ID: ${{ secrets.NOTION_STUDENTS_SOURCE_ID }}
+          NOTION_DAILY_SOURCE_ID: ${{ secrets.NOTION_DAILY_SOURCE_ID }}
+          NOTION_REPORTS_SOURCE_ID: ${{ secrets.NOTION_REPORTS_SOURCE_ID }}
+          PERIOD_START: ${{ inputs.period_start }}
+          APPLY_CHANGES: ${{ github.event_name == 'schedule' || inputs.apply_changes }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            python generate_biweekly_reports.py --scheduled
+          else
+            python generate_biweekly_reports.py
+          fi
