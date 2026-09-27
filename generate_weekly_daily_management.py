@@ -9,8 +9,8 @@
   1. 시간표 생성        : 지난주 같은 요일의 시간표 행을 참고해 이번 주 시간표를 생성.
                           (반/시간/강사/요일/교재이름을 가져오고, 수업내용·숙제·검사일·학원단어·단어시험일은 비움.
                            학생 관계는 이 단계에서 채우지 않음.)
-                          이미 이번 주 (반, 시간) 행이 존재하면 새로 만들지는 않되,
-                          그 행의 강사DB가 비어 있으면 지난주 소스 기준으로 채워 넣는다(백필).
+                          실행 대상 날짜의 시간표가 하나라도 있으면 그대로 사용하며,
+                          전주 복사 및 강사/요일/교재 백필을 하지 않는다.
   2. 수업 배정 결정     : 오늘 시간표의 반/시간과 학생 DB2의 재원생 관계를 대조.
                           같은 학생·시간에 정상반과 임시반이 모두 있으면 임시반을 선택하고,
                           임시반끼리 충돌하면 임의 선택하지 않고 해당 학생을 보류.
@@ -323,31 +323,29 @@ def title_lookup(page_id: str) -> str:
 # --------------------------------------------------------------------------
 
 def step1_generate_timetable(today: date) -> list[dict]:
-    """지난주 같은 요일의 시간표를 복사해 이번 주(=today) 시간표를 생성한다.
-    이미 today 날짜로 생성된 (같은 반/시간) 행이 있으면 새로 만들지는 않되,
-    그 기존 행의 강사DB가 비어 있고 지난주 소스에 강사DB가 있으면 채워 넣는다(백필).
-    반환값: 오늘 생성/확인된 시간표 페이지 리스트 (신규+기존 포함, 3~4단계에서 사용).
-    """
-    last_week = today - timedelta(days=7)
-    log.info("STEP 1: %s(지난주) 기준으로 %s(이번주) 시간표 생성", last_week, today)
+    """대상 날짜 시간표가 있으면 그대로 반환하고, 없을 때만 전주를 복사한다.
 
+    일부 행만 있어도 그 날짜의 확정된 수업 목록으로 취급한다.
+    삭제한 수업이 복원되지 않도록 누락 반/시간 및 빈 속성을 전주에서 보완하지 않는다.
+    """
+    existing_today = query_database_all(
+        TIMETABLE_DB_ID,
+        filter_obj={"property": "출제일", "date": {"equals": today.isoformat()}},
+    )
+    if existing_today:
+        log.info("STEP 1: %s 기존 시간표 %d건 사용 — 전주 복사/백필 생략",
+                 today, len(existing_today))
+        return existing_today
+
+    last_week = today - timedelta(days=7)
+    log.info("STEP 1: %s 시간표 없음 — %s 시간표 복사", today, last_week)
     source_rows = query_database_all(
         TIMETABLE_DB_ID,
         filter_obj={"property": "출제일", "date": {"equals": last_week.isoformat()}},
     )
     log.info("  지난주 시간표 %d건 발견", len(source_rows))
-
-    existing_today = query_database_all(
-        TIMETABLE_DB_ID,
-        filter_obj={"property": "출제일", "date": {"equals": today.isoformat()}},
-    )
     existing_keys = set()
     existing_by_key: dict[tuple, dict] = {}
-    for row in existing_today:
-        ban = tuple(sorted(_normalize_id(i) for i in get_relation_ids(row, BAN_PROP_TT)))
-        key = (ban, get_select_name(row, "시간"))
-        existing_keys.add(key)
-        existing_by_key[key] = row
 
     # 기존 담당은 유지하고, 담당이 필요한 행만 지난주 자료로 검증한다.
     # 같은 반/시간에 서로 다른 강사가 있으면 임의로 첫 강사를 고르지 않는다.
@@ -370,34 +368,7 @@ def step1_generate_timetable(today: date) -> list[dict]:
         time_slot = get_select_name(src, "시간")
         key = (tuple(sorted(_normalize_id(i) for i in ban_ids)), time_slot)
         if key in existing_keys:
-            # 이미 이번 주 행이 있으면 새로 만들지는 않되,
-            # 강사DB가 비어 있는 기존 행이면 지난주 소스 기준으로 채워 넣는다.
-            # (강사DB 로직이 없던 예전 버전 스크립트가 먼저 만들어둔 행을 복구하기 위함)
-            existing_row = existing_by_key.get(key)
-            if existing_row is not None:
-                if not get_select_name(existing_row, "요일"):
-                    patch_row(existing_row, {"요일": {"select": {"name": get_select_name(src, "요일") or "월화수목금토일"[today.weekday()]}}})
-                existing_teacher_ids = get_relation_ids(existing_row, "강사DB")
-                src_teacher_ids = get_relation_ids(src, "강사DB")
-                if not existing_teacher_ids and src_teacher_ids:
-                    patch_row(existing_row, {
-                        "강사DB": {"relation": [{"id": i} for i in src_teacher_ids]}
-                    })
-                    log.info(
-                        "  강사DB 백필: 반=%s 시간=%s -> page=%s",
-                        ban_ids, time_slot, existing_row["id"],
-                    )
-                existing_book_ids = get_relation_ids(existing_row, "교재이름")
-                src_book_ids = get_relation_ids(src, "교재이름")
-                if not existing_book_ids and src_book_ids:
-                    patch_row(existing_row, {
-                        "교재이름": {"relation": [{"id": i} for i in src_book_ids]}
-                    })
-                    log.info(
-                        "  교재이름 백필: 반=%s 시간=%s -> page=%s",
-                        ban_ids, time_slot, existing_row["id"],
-                    )
-            continue  # 이미 이번 주 것이 있으면 새 행은 만들지 않음 (중복 생성 방지)
+            continue  # 지난주 소스에 중복된 반/시간이 있어도 한 번만 생성
 
         properties: dict[str, Any] = {
             "출제일": {"date": {"start": today.isoformat()}},
@@ -764,3 +735,4 @@ if __name__ == "__main__":
     except Exception as exc:  # noqa: BLE001
         log.exception("실행 중 오류 발생: %s", exc)
         sys.exit(1)
+
