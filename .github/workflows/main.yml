@@ -46,6 +46,9 @@ jobs:
 
       - run: pip install requests
 
+      - name: Resolve yesterday in KST
+        run: echo "YESTERDAY_KST=$(date -d 'yesterday' +%F)" >> "$GITHUB_ENV"
+
       - name: Run regression tests
         run: python3 -m unittest discover -s tests -v
 
@@ -62,3 +65,10 @@ jobs:
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           TARGET_DATE: ${{ github.event.inputs.target_date || '' }}
+
+      - name: Sync yesterday teacher cache to Supabase
+        if: ${{ github.event_name == 'schedule' && github.event.inputs.dry_run != '1' }}
+        run: python3 sync_teacher_cache.py
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          TARGET_DATE: ${{ env.YESTERDAY_KST }}
