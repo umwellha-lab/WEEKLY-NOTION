@@ -1,0 +1,44 @@
+name: sync-teacher-cache
+
+on:
+  schedule:
+    # KST Mon-Fri 13:00-23:59, every 15 minutes
+    - cron: "*/15 4-14 * * 1-5"
+    # KST Sat-Sun 09:00-18:59, every 30 minutes (weekend makeups)
+    - cron: "*/30 0-9 * * 6,0"
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: "날짜 (YYYY-MM-DD). 비우면 현재 KST 날짜"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: notion-supabase-teacher-cache
+  cancel-in-progress: true
+
+env:
+  TZ: Asia/Seoul
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install requests
+
+      - name: Sync Notion teacher cache to Supabase
+        run: python3 sync_teacher_cache.py
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          TARGET_DATE: ${{ github.event.inputs.target_date || '' }}
