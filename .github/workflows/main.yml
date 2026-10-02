@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "generate_weekly_daily_management.py"
+      - "sync_teacher_cache.py"
       - "tests/**"
       - ".github/workflows/main.yml"
   schedule:
@@ -24,6 +25,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 concurrency:
   group: notion-daily-management
@@ -52,4 +54,11 @@ jobs:
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}
+          TARGET_DATE: ${{ github.event.inputs.target_date || '' }}
+
+      - name: Sync teacher cache to Supabase
+        if: ${{ github.event.inputs.dry_run != '1' }}
+        run: python3 sync_teacher_cache.py
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           TARGET_DATE: ${{ github.event.inputs.target_date || '' }}
