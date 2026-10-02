@@ -1,6 +1,11 @@
 name: sync-teacher-cache
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - "sync_teacher_cache.py"
+      - ".github/workflows/sync_teacher_cache.yml"
   schedule:
     # KST Mon-Fri 13:00-23:59, every 15 minutes
     - cron: "*/15 4-14 * * 1-5"
