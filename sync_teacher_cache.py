@@ -316,6 +316,24 @@ def push_cache(target_date, caches):
     return r.json()
 
 
+def ping_ingest():
+    token = github_oidc_token()
+    r = requests.post(
+        EDGE_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        json={"ping": True},
+        timeout=30,
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(
+            f"Supabase ingest auth ping failed {r.status_code}: {r.text[:1000]}"
+        )
+    return r.json()
+
+
 def main():
     target_date = os.environ.get("TARGET_DATE", "").strip()
     if not target_date:
@@ -327,6 +345,7 @@ def main():
     caches, timetable_count, daily_count = build_cache(target_date)
 
     if not caches:
+        ping = ping_ingest()
         print(
             json.dumps(
                 {
@@ -335,6 +354,7 @@ def main():
                     "message": "No cache rows to sync",
                     "timetable_rows": timetable_count,
                     "daily_rows": daily_count,
+                    "supabase": ping,
                 },
                 ensure_ascii=False,
             )
