@@ -50,3 +50,9 @@ jobs:
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           TARGET_DATE: ${{ github.event.inputs.target_date || '' }}
+
+      - name: Refresh yesterday after cache code changes
+        if: ${{ github.event_name == 'push' }}
+        run: TARGET_DATE="$(date -d 'yesterday' +%F)" python3 sync_teacher_cache.py
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
