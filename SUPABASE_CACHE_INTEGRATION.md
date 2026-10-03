@@ -76,3 +76,35 @@ Function with a teacher-scoped token. Server access may use a Supabase secret.
    the fallback.
 5. Keep the current Notion read path temporarily as an error fallback until
    production verification is complete.
+
+## Complete editable view payload (cache_version 2)
+
+The existing external sync now reads the same Notion data sources as the Site
+using API version 2025-09-03. It also resolves class/student/book relations and
+queries homework and vocabulary items due on the selected day. All reads must
+succeed before uploading; unresolved teacher relations or pagination failures
+abort the refresh rather than overwrite complete cache data.
+
+Schedule rows include `id`, `notion_page_id`, `notion_url`, each page's exact
+`last_edited_time`, `books`, and `due` alongside the existing fields. Due items
+follow the Site's class/book match, fallback slot/teacher match, and separate
+homework/vocabulary due-date rules. Text whitespace is preserved so the Site's
+write fingerprint matches Notion.
+
+Daily rows include the original edit version, `teacher_id`, `class_id`, resolved
+`class_name`, `student_name`, `linked`, `lesson`, `homework_text`, `assignment`,
+`academy_vocab`, `test_range`, and `followup`. Null scores remain null; zero remains
+zero. The existing score/grade fields and relation arrays remain available.
+
+`data.complete: true` is emitted only after all dependencies were read. Every
+named staff member gets a dated payload, even with no records, so a successfully
+read empty day clears old rows. Each row's version is distinct from the top-level
+maximum Notion edit timestamp. Co-taught rows remain in each teacher's scope;
+the Site may still use its fallback for combined-teacher views.
+
+GitHub OIDC authentication, refresh schedule, Notion source data, the ingest/read
+Edge Functions, and the Site are unchanged. The sync performs only Notion reads
+and the existing Supabase cache upsert. No student data or secrets are fixtures.
+
+Regression tests: `python3 -m unittest discover -s tests -p test_teacher_cache.py -v`.
+The cache workflow runs these tests before uploading.

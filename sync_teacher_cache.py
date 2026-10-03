@@ -29,12 +29,15 @@ from zoneinfo import ZoneInfo
 import requests
 
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "").strip()
-NOTION_VERSION = "2022-06-28"
+NOTION_VERSION = "2025-09-03"
 NOTION_API = "https://api.notion.com/v1"
 
-TIMETABLE_DB_ID = "388fa4082f0480908ce9d71175973068"
-DAILY_DB_ID = "39ffa4082f0480c9a32adee0defc8e74"
-TEACHER_DB_ID = "3526cec7c3f9476a9168da17d62b5fa5"
+TIMETABLE_DB_ID = "b21fa408-2f04-82b5-a2df-879caf869d71"
+DAILY_DB_ID = "39ffa408-2f04-8063-a428-000ba691f9fd"
+TEACHER_DB_ID = "8116e2aa-5ab7-467a-adb0-a36a63fb81fd"
+CLASS_DB_ID = "39ffa408-2f04-8037-84da-000b6396f76a"
+STUDENT_DB_ID = "6f6fa408-2f04-82b3-b538-87a9cefe649e"
+BOOK_DB_ID = "3a0fa408-2f04-80ce-8483-000b410a202c"
 
 EDGE_URL = (
     "https://axwxxqxmozxluduonzql.supabase.co"
@@ -85,19 +88,23 @@ def query_db(db_id, filter_obj=None):
         body["filter"] = filter_obj
 
     cursor = None
+    seen = set()
     while True:
         req = dict(body)
         if cursor:
             req["start_cursor"] = cursor
         data = notion_request(
             "POST",
-            f"/databases/{db_id}/query",
+            f"/data_sources/{db_id}/query",
             req,
         )
-        out.extend(data.get("results", []))
+        out.extend(row for row in data["results"] if not row.get("archived") and not row.get("in_trash"))
         if not data.get("has_more"):
             return out
         cursor = data.get("next_cursor")
+        if not cursor or cursor in seen:
+            raise RuntimeError("Notion pagination did not advance")
+        seen.add(cursor)
 
 
 def rich_text(prop):
@@ -142,7 +149,7 @@ def relation_ids(prop):
 
 
 def norm_id(value):
-    return (value or "").replace("-", "")
+    return (value or "").replace("-", "").lower()
 
 
 def clean_teacher(name):
@@ -170,102 +177,158 @@ def teacher_name_from_title(title):
     return clean_teacher(parts[2]) if len(parts) >= 3 else ""
 
 
+def text(prop):
+    """Match the Site plain() function: preserve whitespace for write fingerprints."""
+    prop = prop or {}
+    return "".join(x.get("plain_text") or x.get("text", {}).get("content", "")
+                   for x in (prop.get("title") or prop.get("rich_text") or []))
+
+
+def display_value(prop):
+    prop = prop or {}
+    if prop.get("type") == "rollup":
+        return "\n".join(filter(None, (display_value(x) for x in prop.get("rollup", {}).get("array", []))))
+    if prop.get("type") == "formula":
+        return str(prop.get("formula", {}).get("string") or "")
+    return text(prop)
+
+
+def names(rows, field):
+    return {norm_id(r["id"]): text(r.get("properties", {}).get(field)) for r in rows}
+
+
+def rel(prop):
+    if (prop or {}).get("has_more"):
+        raise RuntimeError("Truncated Notion relation; refusing an incomplete cache")
+    return [norm_id(x) for x in relation_ids(prop)]
+
+
+def page_version(page):
+    value = page.get("last_edited_time")
+    if not value:
+        raise RuntimeError("Notion page edit version missing")
+    return value
+
+
+def notion_url(page_id):
+    return "https://www.notion.so/" + norm_id(page_id)
+
+
+def due_for_lesson(lesson, sources, day, book_names):
+    """Same class/book/slot rules as Site lib/lesson-due.ts."""
+    p = lesson.get("properties", {})
+    classes, books = set(rel(p.get("반 DB"))), set(rel(p.get("교재이름")))
+    result = []
+    for source in sources:
+        if norm_id(source["id"]) == norm_id(lesson["id"]):
+            continue
+        q = source.get("properties", {})
+        assigned = (date_start(q.get("출제일")) or "")[:10]
+        if not assigned or assigned > day or not classes.intersection(rel(q.get("반 DB"))):
+            continue
+        source_books = rel(q.get("교재이름"))
+        book_match = bool(books and source_books)
+        if book_match:
+            if not books.intersection(source_books):
+                continue
+        elif (not select_name(p.get("시간"))
+              or select_name(p.get("시간")) != select_name(q.get("시간"))
+              or not set(rel(p.get("강사DB"))).intersection(rel(q.get("강사DB")))):
+            continue
+        homework = text(q.get("숙제+교재단어")) if (date_start(q.get("검사일")) or "")[:10] == day else ""
+        words = text(q.get("학원단어")) if (date_start(q.get("단어시험일")) or "")[:10] == day else ""
+        if not homework.strip() and not words.strip():
+            continue
+        result.append({"id": source["id"], "assignedDate": assigned,
+                       "books": [book_names.get(x) or "교재명 확인 필요" for x in source_books],
+                       "homework": homework, "words": words,
+                       "matchNote": "" if book_match else "교재 미입력 · 같은 반·시간·담당 기준",
+                       "notionUrl": notion_url(source["id"])})
+    return sorted(result, key=lambda r: (r["assignedDate"], r["id"]))
+
+
 def build_cache(target_date):
-    teachers = teacher_map()
+    # Read every dependency before creating/uploading a snapshot. Failed or
+    # truncated reads must never replace the last complete cache with partial data.
+    datetime.strptime(target_date, "%Y-%m-%d")
+    staff = query_db(TEACHER_DB_ID)
+    teachers = {norm_id(p["id"]): clean_teacher(text(p.get("properties", {}).get("이름"))) for p in staff}
+    if len([n for n in teachers.values() if n]) != len(set(n for n in teachers.values() if n)):
+        raise RuntimeError("Ambiguous teacher names")
+    timetable = query_db(TIMETABLE_DB_ID, {"property": "출제일", "date": {"equals": target_date}})
+    daily = query_db(DAILY_DB_ID, {"property": "날짜", "date": {"equals": target_date}})
+    classes = query_db(CLASS_DB_ID)
+    students = query_db(STUDENT_DB_ID)
+    books = query_db(BOOK_DB_ID)
+    due_sources = query_db(TIMETABLE_DB_ID, {"or": [
+        {"property": "검사일", "date": {"equals": target_date}},
+        {"property": "단어시험일", "date": {"equals": target_date}},
+    ]})
+    cn, sn, bn = names(classes, "반 이름"), names(students, "이름"), names(books, "이름")
+    groups = {n: {"schedule": [], "daily_management": []} for n in teachers.values() if n}
 
-    timetable = query_db(
-        TIMETABLE_DB_ID,
-        {
-            "property": "출제일",
-            "date": {"equals": target_date},
-        },
-    )
-    daily = query_db(
-        DAILY_DB_ID,
-        {
-            "property": "날짜",
-            "date": {"equals": target_date},
-        },
-    )
-
-    groups = {}
-
-    def ensure(name):
-        if not name:
-            return None
-        return groups.setdefault(
-            name,
-            {"schedule": [], "daily_management": []},
-        )
+    def assigned(p, field):
+        ids = rel(p.get(field))
+        if not ids or any(not teachers.get(i) for i in ids):
+            raise RuntimeError("Missing or unresolved teacher relation; refusing partial cache")
+        return ids
 
     for page in timetable:
         p = page.get("properties", {})
-        title = rich_text(p.get("날짜 반이름 담당"))
-        rel = relation_ids(p.get("강사DB"))
-        teacher = teachers.get(norm_id(rel[0])) if rel else None
-        teacher = teacher or teacher_name_from_title(title)
-        bucket = ensure(teacher)
-        if bucket is None:
-            continue
-
-        bucket["schedule"].append(
-            {
-                "time": select_name(p.get("시간")),
-                "class_name": class_name_from_title(title),
-                "lesson": rich_text(p.get("오늘 수업내용")),
-                "homework": rich_text(p.get("숙제+교재단어")),
-                "academy_vocab": rich_text(p.get("학원단어")),
-                "check_date": date_start(p.get("검사일")),
-                "vocab_test_date": date_start(p.get("단어시험일")),
-                "notion_page_id": page.get("id"),
-            }
-        )
+        ids = assigned(p, "강사DB")
+        row = {
+            "id": page["id"], "notion_page_id": page["id"],
+            "notion_url": notion_url(page["id"]), "last_edited_time": page_version(page),
+            "time": select_name(p.get("시간")) or "",
+            "class_name": " · ".join(filter(None, (cn.get(i) for i in rel(p.get("반 DB"))))) or "반 미지정",
+            "lesson": text(p.get("오늘 수업내용")), "homework": text(p.get("숙제+교재단어")),
+            "academy_vocab": text(p.get("학원단어")),
+            "check_date": (date_start(p.get("검사일")) or "")[:10],
+            "vocab_test_date": (date_start(p.get("단어시험일")) or "")[:10],
+            "books": [bn.get(i) or "교재명 확인 필요" for i in rel(p.get("교재이름"))],
+            "due": due_for_lesson(page, due_sources, target_date, bn),
+        }
+        for teacher_id in ids:
+            groups[teachers[teacher_id]]["schedule"].append(dict(row))
 
     for page in daily:
         p = page.get("properties", {})
-        rel = relation_ids(p.get("담당"))
-        teacher = teachers.get(norm_id(rel[0])) if rel else None
-        bucket = ensure(teacher)
-        if bucket is None:
-            continue
+        ids = assigned(p, "담당")
+        class_ids, student_ids = relation_ids(p.get("반 DB")), relation_ids(p.get("학생"))
+        rel(p.get("반 DB")); rel(p.get("학생"))
+        source_ids = rel(p.get("출제 시간표"))
+        source = next((t for t in timetable if norm_id(t["id"]) in source_ids), {})
+        source_p = source.get("properties", {})
+        student_id = norm_id(student_ids[0]) if student_ids else ""
+        row = {
+            "id": page["id"], "notion_page_id": page["id"],
+            "notion_url": notion_url(page["id"]), "last_edited_time": page_version(page),
+            "student_name": sn.get(student_id) or "학생 연결 확인 필요", "linked": bool(sn.get(student_id)),
+            "class_id": class_ids[0] if class_ids else "",
+            "class_name": cn.get(norm_id(class_ids[0])) or "반 미지정" if class_ids else "반 미지정",
+            "time": select_name(p.get("수업시간")) or "",
+            "homework_grade": select_name(p.get("과제")), "blank_test_grade": select_name(p.get("백지")),
+            "academy_vocab_wrong": number_value(p.get("오답수(학원단어)")),
+            "academy_vocab_total": number_value(p.get("만점(학원)")),
+            "textbook_vocab_wrong": number_value(p.get("오답수(교재)")),
+            "textbook_vocab_total": number_value(p.get("만점(교재)")),
+            "absent": checkbox_value(p.get("결석 체크")),
+            "class_ids": class_ids, "student_ids": student_ids,
+            "lesson": text(source_p.get("오늘 수업내용")), "homework_text": display_value(p.get("검사할 숙제")),
+            "assignment": text(source_p.get("숙제+교재단어")), "academy_vocab": text(source_p.get("학원단어")),
+            "test_range": display_value(p.get("시험 범위")),
+            "followup": " · ".join(filter(None, [display_value(p.get("재시험 대상 과목")), display_value(p.get("재검사 대상 과목"))])),
+        }
+        for teacher_id in ids:
+            # Keep Notion's original primary teacher ID: secondary-teacher views
+            # safely fall back in the Site until its multi-teacher adapter exists.
+            groups[teachers[teacher_id]]["daily_management"].append({**row, "teacher_id": relation_ids(p.get("담당"))[0]})
 
-        bucket["daily_management"].append(
-            {
-                "student_name": rich_text(p.get("이름")),
-                "time": select_name(p.get("수업시간")),
-                "homework_grade": select_name(p.get("과제")),
-                "blank_test_grade": select_name(p.get("백지")),
-                "academy_vocab_wrong": number_value(
-                    p.get("오답수(학원단어)")
-                ),
-                "academy_vocab_total": number_value(p.get("만점(학원)")),
-                "textbook_vocab_wrong": number_value(
-                    p.get("오답수(교재)")
-                ),
-                "textbook_vocab_total": number_value(p.get("만점(교재)")),
-                "absent": checkbox_value(p.get("결석 체크")),
-                "class_ids": relation_ids(p.get("반 DB")),
-                "student_ids": relation_ids(p.get("학생")),
-                "notion_page_id": page.get("id"),
-            }
-        )
-
-    caches = []
-    for teacher, data in sorted(groups.items()):
-        caches.append(
-            {
-                "teacher": teacher,
-                "notion_updated_at": datetime.now(KST).isoformat(),
-                "data": {
-                    "schedule": data["schedule"],
-                    "daily_management": data["daily_management"],
-                    "source_date": target_date,
-                    "source": "Notion",
-                    "cache_version": 1,
-                },
-            }
-        )
-
+    pages = staff + timetable + daily + classes + students + books + due_sources
+    updated_at = max((page_version(p) for p in pages), default=datetime.now(KST).isoformat())
+    caches = [{"teacher": teacher, "notion_updated_at": updated_at, "data": {
+        **data, "source_date": target_date, "source": "Notion", "cache_version": 2, "complete": True,
+    }} for teacher, data in sorted(groups.items())]
     return caches, len(timetable), len(daily)
 
 
