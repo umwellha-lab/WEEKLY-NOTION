@@ -6,11 +6,9 @@
 
 5단계 루틴을 실제로 실행하는 스크립트입니다.
 
-  1. 시간표 생성        : 지난주 같은 요일의 시간표 행을 참고해 이번 주 시간표를 생성.
-                          (반/시간/강사/요일/교재이름을 가져오고, 수업내용·숙제·검사일·학원단어·단어시험일은 비움.
-                           학생 관계는 이 단계에서 채우지 않음.)
-                          실행 대상 날짜의 시간표가 하나라도 있으면 그대로 사용하며,
-                          전주 복사 및 강사/요일/교재 백필을 하지 않는다.
+  1. 시간표 조회        : 담당자가 준비한 대상 날짜의 시간표만 사용.
+                          시간표가 없으면 종료하며 전주 복사·수업 추가·담당 백필은 하지 않음.
+                          반 없는 행은 제외하고, 반 있는 행의 시간·담당을 쓰기 전에 검증.
   2. 수업 배정 결정     : 오늘 시간표의 반/시간과 학생 DB2의 재원생 관계를 대조.
                           같은 학생·시간에 정상반과 임시반이 모두 있으면 임시반을 선택하고,
                           임시반끼리 충돌하면 임의 선택하지 않고 해당 학생을 보류.
@@ -63,7 +61,7 @@ import os
 import sys
 import time
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 from urllib.parse import urlencode
 from typing import Any, Optional
@@ -102,9 +100,6 @@ TEMP_CLASS_PREFIXES = tuple(
     if item.strip()
 )
 
-# 시간표 생성 시 교재 관계만 유지. 수업내용/숙제/시험 범위 및 날짜는 복사하지 않음.
-CARRY_OVER_PROPS = ["교재이름"]
-
 # 실행 시작 시 실제 스키마를 조회해서 채워지는 값들 (혹시 모를 이름 불일치 방지용 안전장치)
 BAN_PROP_TT: str = ""       # 시간표 DB의 "반 DB" 속성 실제 이름
 BAN_PROP_DAILY: str = ""    # 매일관리 DB의 "반 DB" 속성 실제 이름
@@ -124,7 +119,7 @@ def resolve_all_property_names() -> None:
     BAN_PROP_STUDENT = resolve_property_name(student_schema, "반 DB")
     # 강사DB는 relation 속성인지 확인하되, 관계 대상 DB ID 노출 여부로 실행을 막지 않는다.
     # Notion은 연결 권한/응답 형태에 따라 relation 설정의 database_id를 생략할 수 있다.
-    # 실제 강사 관계 값은 STEP 1에서 소스 행별로 검증하므로 빈 강사 데이터는 생성되지 않는다.
+    # 실제 강사 관계 값은 STEP 1에서 당일 행별로 검증한다.
     teacher_prop = tt_schema.get("properties", {}).get("강사DB", {})
     if teacher_prop.get("type") != "relation":
         raise RuntimeError("시간표의 강사DB 속성이 relation이 아닙니다. 속성 유형을 확인하세요.")
@@ -319,98 +314,27 @@ def title_lookup(page_id: str) -> str:
 
 
 # --------------------------------------------------------------------------
-# STEP 1: 시간표 생성 (지난주 참고)
+# STEP 1: 담당자가 준비한 당일 시간표 조회 (시간표 생성 금지)
 # --------------------------------------------------------------------------
 
 def step1_generate_timetable(today: date) -> list[dict]:
-    """대상 날짜 시간표가 있으면 그대로 반환하고, 없을 때만 전주를 복사한다.
-
-    일부 행만 있어도 그 날짜의 확정된 수업 목록으로 취급한다.
-    삭제한 수업이 복원되지 않도록 누락 반/시간 및 빈 속성을 전주에서 보완하지 않는다.
-    """
-    existing_today = query_database_all(
+    """기존 호출 이름을 유지하되, 시간표를 읽기만 한다. 전주 복사는 금지한다."""
+    rows = query_database_all(
         TIMETABLE_DB_ID,
         filter_obj={"property": "출제일", "date": {"equals": today.isoformat()}},
     )
-    if existing_today:
-        log.info("STEP 1: %s 기존 시간표 %d건 사용 — 전주 복사/백필 생략",
-                 today, len(existing_today))
-        return existing_today
-
-    last_week = today - timedelta(days=7)
-    log.info("STEP 1: %s 시간표 없음 — %s 시간표 복사", today, last_week)
-    source_rows = query_database_all(
-        TIMETABLE_DB_ID,
-        filter_obj={"property": "출제일", "date": {"equals": last_week.isoformat()}},
-    )
-    log.info("  지난주 시간표 %d건 발견", len(source_rows))
-    existing_keys = set()
-    existing_by_key: dict[tuple, dict] = {}
-
-    # 기존 담당은 유지하고, 담당이 필요한 행만 지난주 자료로 검증한다.
-    # 같은 반/시간에 서로 다른 강사가 있으면 임의로 첫 강사를 고르지 않는다.
-    source_teachers = {}
-    for src in source_rows:
-        key = (tuple(sorted(_normalize_id(i) for i in get_relation_ids(src, BAN_PROP_TT))), get_select_name(src, "시간"))
-        ids = get_relation_ids(src, "강사DB")
-        source_teachers.setdefault(key, set()).add(tuple(sorted(_normalize_id(i) for i in ids)))
-    for key, choices in source_teachers.items():
-        existing = existing_by_key.get(key)
-        if existing is not None and get_relation_ids(existing, "강사DB"):
+    usable = []
+    for row in rows:
+        if not get_relation_ids(row, BAN_PROP_TT):
+            log.warning("반 없는 시간표 제외: %s", row["id"])
             continue
-        if len(choices) != 1 or not next(iter(choices)):
-            raise RuntimeError(f"강사DB가 비어 있거나 지난주 강사가 서로 달라 생성/보완할 수 없습니다: {key}. 원본과 Integration 접근을 확인하세요.")
-
-    today_rows = list(existing_today)
-
-    for src in source_rows:
-        ban_ids = get_relation_ids(src, BAN_PROP_TT)
-        time_slot = get_select_name(src, "시간")
-        key = (tuple(sorted(_normalize_id(i) for i in ban_ids)), time_slot)
-        if key in existing_keys:
-            continue  # 지난주 소스에 중복된 반/시간이 있어도 한 번만 생성
-
-        properties: dict[str, Any] = {
-            "출제일": {"date": {"start": today.isoformat()}},
-        }
-        if time_slot:
-            properties["시간"] = {"select": {"name": time_slot}}
-        weekday = get_select_name(src, "요일") or "월화수목금토일"[today.weekday()]
-        if weekday:
-            properties["요일"] = {"select": {"name": weekday}}
-        if ban_ids:
-            properties[BAN_PROP_TT] = {"relation": [{"id": i} for i in ban_ids]}
-        teacher_ids = get_relation_ids(src, "강사DB")
-        if teacher_ids:
-            properties["강사DB"] = {"relation": [{"id": i} for i in teacher_ids]}
-
-        # 교재이름 관계만 복사
-        for prop_name in CARRY_OVER_PROPS:
-            src_prop = src.get("properties", {}).get(prop_name)
-            if not src_prop:
-                continue
-            ptype = src_prop.get("type")
-            if ptype == "rich_text" and src_prop.get("rich_text"):
-                properties[prop_name] = {"rich_text": src_prop["rich_text"]}
-            elif ptype == "relation" and src_prop.get("relation"):
-                properties[prop_name] = {"relation": src_prop["relation"]}
-
-        # 명시적으로 비워 기본값이나 지난주 입력이 새 시간표에 이어지지 않게 한다.
-        for text_prop in ("오늘 수업내용", "숙제+교재단어", "학원단어"):
-            properties[text_prop] = {"rich_text": []}
-        for date_prop in ("검사일", "단어시험일"):
-            properties[date_prop] = {"date": None}
-
-        properties["데이터생성"] = {"select": {"name": "생성완료"}}
-
-        new_page = create_page(TIMETABLE_DB_ID, properties)
-        log.info("  생성됨: 반=%s 시간=%s -> page=%s", ban_ids, time_slot, new_page["id"])
-        today_rows.append(new_page)
-        existing_keys.add(key)
-        existing_by_key[key] = new_page
-
-    log.info("STEP 1 완료: 오늘 기준 시간표 %d건", len(today_rows))
-    return today_rows
+        daily_slot(get_select_name(row, "시간"))
+        if len(get_relation_ids(row, "강사DB")) != 1:
+            raise RuntimeError(f"시간표 담당은 정확히 한 명이어야 합니다: {row['id']}")
+        usable.append(row)
+    log.info("STEP 1: %s 기존 시간표=%d, 수업 대상=%d (자동 복사 없음)",
+             today, len(rows), len(usable))
+    return usable
 
 
 # --------------------------------------------------------------------------
@@ -723,6 +647,9 @@ def main():
     resolve_all_property_names()
 
     timetable_rows = step1_generate_timetable(today)
+    if not timetable_rows:
+        log.warning("대상 날짜의 수업 시간표가 없어 매일관리를 생성하지 않습니다.")
+        return
     daily_rows = step2_3_generate_daily(today, timetable_rows)
     step4_link_exam_days(today, daily_rows, timetable_rows)
 

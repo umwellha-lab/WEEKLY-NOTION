@@ -38,19 +38,22 @@ class GenerationTests(unittest.TestCase):
         self.globals.start()
         self.addCleanup(self.globals.stop)
 
-    def test_new_timetable_copies_teacher_weekday_but_clears_lesson_fields(self):
-        source = timetable()
-        for name in ("오늘 수업내용", "숙제+교재단어", "학원단어"):
-            source["properties"][name] = {"type": "rich_text", "rich_text": [{"text": {"content": "previous lesson"}}]}
-        with patch.object(g, "query_database_all", side_effect=[[], [source]]):
-            result = g.step1_generate_timetable(TODAY)
-        props = result[0]["properties"]
-        self.assertEqual(g.get_relation_ids(result[0], "강사DB"), ["teacher1"])
-        self.assertEqual(g.get_select_name(result[0], "요일"), "화")
-        for name in ("오늘 수업내용", "숙제+교재단어", "학원단어"):
-            self.assertEqual(props[name], {"rich_text": []})
-        for name in ("검사일", "단어시험일"):
-            self.assertEqual(props[name], {"date": None})
+    def test_missing_timetable_never_queries_last_week_or_writes(self):
+        with patch.object(g, "query_database_all", return_value=[]) as query, \
+                patch.object(g, "create_page") as create, patch.object(g, "update_page") as update:
+            self.assertEqual(g.step1_generate_timetable(TODAY), [])
+        query.assert_called_once()
+        create.assert_not_called()
+        update.assert_not_called()
+
+    def test_no_class_rows_are_excluded_without_modification(self):
+        empty = timetable("empty")
+        empty["properties"]["반"] = rel()
+        valid = timetable()
+        with patch.object(g, "query_database_all", return_value=[empty, valid]), \
+                patch.object(g, "update_page") as update:
+            self.assertEqual(g.step1_generate_timetable(TODAY), [valid])
+        update.assert_not_called()
 
     def test_existing_timetable_preserves_blank_weekday_and_lesson(self):
         existing = timetable()
@@ -61,11 +64,12 @@ class GenerationTests(unittest.TestCase):
         self.assertIsNone(g.get_select_name(result[0], "요일"))
         self.assertEqual(g.get_rich_text(result[0], "숙제+교재단어"), "current homework")
 
-    def test_missing_or_conflicting_source_teacher_prevents_creation(self):
-        missing = timetable()
-        missing["properties"]["강사DB"] = rel()
-        for sources in ([missing], [timetable(), timetable("tt2", teacher="other")]):
-            with patch.object(g, "query_database_all", side_effect=[[], sources]), patch.object(g, "create_page") as create:
+    def test_missing_or_multiple_teachers_prevent_generation(self):
+        for teachers in (rel(), rel("teacher1", "teacher2")):
+            invalid = timetable()
+            invalid["properties"]["강사DB"] = teachers
+            with patch.object(g, "query_database_all", return_value=[invalid]), \
+                    patch.object(g, "create_page") as create:
                 with self.assertRaises(RuntimeError):
                     g.step1_generate_timetable(TODAY)
                 create.assert_not_called()
@@ -216,15 +220,41 @@ class GenerationTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(g.get_relation_ids(rows[0], "학생"), ["student2"])
 
-    def test_existing_timetable_never_backfills_teacher_or_copies_old_classes(self):
+    def test_existing_timetable_teacher_is_never_backfilled(self):
         existing = timetable()
         existing["properties"]["강사DB"] = rel()
-        with patch.object(g, "query_database_all", side_effect=[[existing]]), patch.object(g, "update_page") as update, patch.object(g, "create_page") as create:
-            rows = g.step1_generate_timetable(TODAY)
-        self.assertEqual(rows, [existing])
-        self.assertEqual(g.get_relation_ids(rows[0], "강사DB"), [])
+        with patch.object(g, "query_database_all", return_value=[existing]) as query, \
+                patch.object(g, "update_page") as update, patch.object(g, "create_page") as create:
+            with self.assertRaises(RuntimeError):
+                g.step1_generate_timetable(TODAY)
+        query.assert_called_once()
         update.assert_not_called()
         create.assert_not_called()
+
+    def test_main_stops_without_timetable(self):
+        with patch.object(g, "resolve_all_property_names"), \
+                patch.object(g, "step1_generate_timetable", return_value=[]), \
+                patch.object(g, "step2_3_generate_daily") as generate, \
+                patch.object(g, "step4_link_exam_days") as link:
+            g.main()
+        generate.assert_not_called()
+        link.assert_not_called()
+
+    def test_correction_preserves_entered_scores_and_attendance(self):
+        existing = daily(teacher="old-teacher")
+        fields = {"결석 체크": {"checkbox": True}, "학원단어점수(숫자)": {"number": 85},
+                  "과제": {"select": {"name": "B"}}}
+        existing["properties"].update(copy.deepcopy(fields))
+        student = row("student1", 이름={"title": [{"text": {"content": "Test"}}]})
+        with patch.object(g, "query_database_all", return_value=[existing]), \
+                patch.object(g, "get_active_students_for_class", return_value=[student]), \
+                patch.object(g, "title_lookup", return_value="Test"), \
+                patch.object(g, "update_page") as update:
+            g.step2_3_generate_daily(TODAY, [timetable()])
+        for name, value in fields.items():
+            self.assertEqual(existing["properties"][name], value)
+            for call in update.call_args_list:
+                self.assertNotIn(name, call.args[1])
 
     def test_wrong_slot_not_linked_and_no_daily_created(self):
         with patch.object(g, "query_database_all", return_value=[timetable(slot="8시 40")]), patch.object(g, "update_page") as update, patch.object(g, "create_page") as create:
