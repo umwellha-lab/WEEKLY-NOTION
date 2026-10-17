@@ -1,0 +1,43 @@
+name: lesson-material-ingest
+
+on:
+  schedule:
+    - cron: '17 * * * *' # Hourly UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lesson-material-ingest
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install processing dependencies
+        run: pip install 'pymupdf>=1.24,<2' 'google-api-python-client>=2.140,<3' 'google-auth>=2.30,<3'
+      - name: Unit splitter regression tests
+        run: python -m unittest discover -s lesson_pipeline/tests -v
+      - name: Check Google Drive credentials
+        id: config
+        env:
+          GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          if [ -z "$GDRIVE_SERVICE_ACCOUNT_JSON" ]; then
+            echo 'GDRIVE_SERVICE_ACCOUNT_JSON not configured; ingestion remains inactive.'
+            echo 'configured=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'configured=true' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Find and split new PDF uploads
+        if: steps.config.outputs.configured == 'true'
+        env:
+          GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+        run: python lesson_pipeline/poll_drive.py
